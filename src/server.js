@@ -6,7 +6,6 @@ import jwt from 'jsonwebtoken'
 import { Server as SocketServer } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import { config, demoMode, pool, state } from './db.js'
-import { player } from '../../frontend/src/data/mockData.js'
 import { GAME_COLORS, compareTotalWins, rankCoinBalances } from './gameRules.js'
 import {
   createUser,
@@ -46,6 +45,7 @@ const io = new SocketServer(app.server, { cors: { origin: config.CLIENT_URL, cre
 const now = () => new Date().toISOString()
 const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
 const publicUser = (user) => ({ id: user.id, username: user.username, email: user.email, role: user.role, status: user.status, displayName: user.displayName })
+const demoPlayer = { name: 'Alex Morgan', username: '@alexm', coins: 1250, level: 18, currentXp: 720, wins: 142, gamesPlayed: 180 }
 function issueToken(user) { return jwt.sign({ sub: user.id, role: user.role }, config.JWT_SECRET, { expiresIn: '7d' }) }
 async function currentUser(request) {
   const token = request.cookies.session || request.headers.authorization?.replace(/^Bearer\s+/i, '')
@@ -72,10 +72,10 @@ async function requireAdmin(request, reply) {
 function seed() {
   if (state.users.length) return
   const id = 'demo-user-alex'
-  const user = { id, username: player.username, email: 'alex@example.com', passwordHash: bcrypt.hashSync('demo-password', 10), role: 'user', status: 'active', displayName: player.name, wins: player.wins, gamesPlayed: player.gamesPlayed, createdAt: now() }
+  const user = { id, username: demoPlayer.username, email: 'alex@example.com', passwordHash: bcrypt.hashSync('demo-password', 10), role: 'user', status: 'active', displayName: demoPlayer.name, wins: demoPlayer.wins, gamesPlayed: demoPlayer.gamesPlayed, createdAt: now() }
   state.users.push(user)
-  state.profiles.push({ userId: id, displayName: player.name, bio: '', avatarUrl: null, level: player.level, experience: player.currentXp })
-  state.wallets.push({ userId: id, balance: player.coins })
+  state.profiles.push({ userId: id, displayName: demoPlayer.name, bio: '', avatarUrl: null, level: demoPlayer.level, experience: demoPlayer.currentXp })
+  state.wallets.push({ userId: id, balance: demoPlayer.coins })
   state.groups.push({ id: 'demo-color-chasers', name: 'Color Chasers', icon: null, ownerId: id, visibility: 'public', memberCount: 128, createdAt: now() })
 }
 if (demoMode) seed()
