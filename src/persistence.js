@@ -139,9 +139,15 @@ export async function createUser({ id = randomUUID(), username, email, passwordH
     )
     const wallet = await client.query(
       `INSERT INTO coin_wallets (user_id, balance)
-       VALUES ($1, 0)
+       VALUES ($1, 120)
        RETURNING user_id, balance, created_at, updated_at`,
       [user.id],
+    )
+    await client.query(
+      `INSERT INTO coin_transactions
+         (id, user_id, type, amount, balance_before, balance_after, reference_type, reference_id, description, idempotency_key)
+       VALUES ($1, $2, 'SIGNUP_BONUS', 120, 0, 120, 'signup', $3, 'Signup bonus', $4)`,
+      [randomUUID(), user.id, user.id, `signup-bonus:${user.id}`],
     )
     return {
       user: mapUser({ ...user, display_name: displayName }),

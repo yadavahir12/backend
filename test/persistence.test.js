@@ -26,7 +26,7 @@ import {
   unfollowUser,
 } from '../src/persistence.js'
 
-function createFakePool(results, failAt) {
+function createFakePool(results, failAt, failure = new Error('database failure')) {
   const calls = []
   let queryIndex = 0
   let released = false
@@ -35,7 +35,7 @@ function createFakePool(results, failAt) {
       calls.push({ text, values })
       if (text === 'ROLLBACK' || text === 'BEGIN' || text === 'COMMIT') return { rows: [] }
       const resultIndex = queryIndex++
-      if (resultIndex === failAt) throw new Error('database failure')
+      if (resultIndex === failAt) throw failure
       const result = results[resultIndex]
       return { rows: Array.isArray(result) ? result : result ? [result] : [] }
     },
@@ -54,11 +54,11 @@ function createFakePool(results, failAt) {
   }
 }
 
-test('creates a user, profile, and wallet atomically with a password hash', async () => {
+test('creates a user, profile, and 120-Coin signup bonus atomically', async () => {
   const database = createFakePool([
     { id: 'user-id', username: 'player', email: 'player@example.com', role: 'user', status: 'active' },
     { user_id: 'user-id', display_name: 'Player', bio: '', level: 1, experience: 0, privacy: {} },
-    { user_id: 'user-id', balance: 0 },
+    { user_id: 'user-id', balance: 120 },
   ])
   const result = await createUser({
     id: 'user-id',
@@ -66,19 +66,71 @@ test('creates a user, profile, and wallet atomically with a password hash', asyn
     email: 'player@example.com',
     passwordHash: '$2b$12$hashed',
     displayName: 'Player',
+    bonusAmount: 999,
+    idempotencyKey: 'client-controlled-key',
   }, database)
 
-  assert.equal(result.user.id, 'user-id')
+  assert.deepEqual(result.user, {
+    id: 'user-id',
+    username: 'player',
+    email: 'player@example.com',
+    role: 'user',
+    status: 'active',
+    displayName: 'Player',
+  })
   assert.equal(result.profile.userId, 'user-id')
-  assert.equal(result.wallet.balance, 0)
+  assert.equal(result.wallet.balance, 120)
   assert.deepEqual(database.calls.map(({ text }) => text), [
     'BEGIN',
     'INSERT INTO users (id, username, email, password_hash)\n       VALUES ($1, $2, $3, $4)\n       RETURNING id, username, email, role, status',
     'INSERT INTO profiles (user_id, display_name)\n       VALUES ($1, $2)\n       RETURNING user_id, display_name, bio, avatar_url, level, experience, privacy, created_at, updated_at',
-    'INSERT INTO coin_wallets (user_id, balance)\n       VALUES ($1, 0)\n       RETURNING user_id, balance, created_at, updated_at',
+    'INSERT INTO coin_wallets (user_id, balance)\n       VALUES ($1, 120)\n       RETURNING user_id, balance, created_at, updated_at',
+    `INSERT INTO coin_transactions
+         (id, user_id, type, amount, balance_before, balance_after, reference_type, reference_id, description, idempotency_key)
+       VALUES ($1, $2, 'SIGNUP_BONUS', 120, 0, 120, 'signup', $3, 'Signup bonus', $4)`,
     'COMMIT',
   ])
   assert.deepEqual(database.calls[1].values, ['user-id', 'player', 'player@example.com', '$2b$12$hashed'])
+  assert.deepEqual(database.calls[4].values.slice(1), ['user-id', 'user-id', 'signup-bonus:user-id'])
+  assert.equal(database.calls.filter(({ text }) => text.startsWith('INSERT INTO coin_transactions')).length, 1)
+  assert.equal(database.released, true)
+})
+
+test('rolls back account and wallet creation when signup bonus ledger insertion fails', async () => {
+  const database = createFakePool([
+    { id: 'user-id', username: 'player', email: 'player@example.com', role: 'user', status: 'active' },
+    { user_id: 'user-id', display_name: 'Player', bio: '', level: 1, experience: 0, privacy: {} },
+    { user_id: 'user-id', balance: 120 },
+  ], 3)
+
+  await assert.rejects(() => createUser({
+    id: 'user-id',
+    username: 'player',
+    email: 'player@example.com',
+    passwordHash: '$2b$12$hashed',
+    displayName: 'Player',
+  }, database), /database failure/)
+
+  assert.equal(database.calls.some(({ text }) => text.startsWith('INSERT INTO coin_transactions')), true)
+  assert.equal(database.calls.at(-1).text, 'ROLLBACK')
+  assert.equal(database.released, true)
+})
+
+test('duplicate registration fails before a second signup bonus can be recorded', async () => {
+  const duplicateUserError = Object.assign(new Error('duplicate user'), { code: '23505' })
+  const database = createFakePool([], 0, duplicateUserError)
+
+  await assert.rejects(() => createUser({
+    id: 'user-id',
+    username: 'player',
+    email: 'player@example.com',
+    passwordHash: '$2b$12$hashed',
+    displayName: 'Player',
+  }, database), { code: '23505' })
+
+  assert.equal(database.calls.some(({ text }) => text.startsWith('INSERT INTO coin_wallets')), false)
+  assert.equal(database.calls.some(({ text }) => text.startsWith('INSERT INTO coin_transactions')), false)
+  assert.equal(database.calls.at(-1).text, 'ROLLBACK')
   assert.equal(database.released, true)
 })
 
