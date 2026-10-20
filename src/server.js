@@ -38,9 +38,16 @@ import {
 } from './persistence.js'
 
 const app = Fastify({ logger: true })
-await app.register(cors, { origin: config.CLIENT_URL, credentials: true })
+const corsOrigins = [...new Set([
+  config.CLIENT_URL,
+  'https://win-chat-frontend-two.vercel.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+].filter((origin) => origin && origin !== '*'))]
+const corsOptions = { origin: corsOrigins, credentials: true }
+await app.register(cors, corsOptions)
 await app.register(cookie)
-const io = new SocketServer(app.server, { cors: { origin: config.CLIENT_URL, credentials: true } })
+const io = new SocketServer(app.server, { cors: corsOptions })
 
 const now = () => new Date().toISOString()
 const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)
