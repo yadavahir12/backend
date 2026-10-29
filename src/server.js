@@ -40,12 +40,13 @@ import {
 const app = Fastify({ logger: true })
 const corsOrigins = [...new Set([
   config.CLIENT_URL,
+  'https://win-chat-frontend-beta.vercel.app',
   'https://win-chat-frontend.vercel.app',
   'https://win-chat-frontend-two.vercel.app',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
 ].filter((origin) => origin && origin !== '*'))]
-const corsOptions = { origin: corsOrigins, credentials: true }
+const corsOptions = { origin: corsOrigins, credentials: true, methods: ['GET', 'HEAD', 'POST', 'PATCH', 'DELETE'] }
 await app.register(cors, corsOptions)
 await app.register(cookie)
 const io = new SocketServer(app.server, { cors: corsOptions })
