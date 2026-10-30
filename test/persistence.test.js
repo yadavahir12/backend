@@ -14,6 +14,7 @@ import {
   getGroup,
   getGroupMessages,
   getGroups,
+  isGroupMember,
   getNotifications,
   getPersistentLeaderboard,
   getUserById,
@@ -297,6 +298,19 @@ test('creates a group and its owner membership in one transaction', async () => 
   assert.deepEqual(database.calls[1].values, ['group-id', 'Players', 'icon', 'owner-id', 'public'])
   assert.deepEqual(database.calls[2].values, ['group-id', 'owner-id'])
   assert.equal(database.calls.at(-1).text, 'COMMIT')
+})
+
+test('checks active group membership before authorizing a realtime room', async () => {
+  const database = createFakePool([{ '?column?': 1 }, undefined])
+
+  assert.equal(await isGroupMember('group-id', 'member-id', database), true)
+  assert.equal(await isGroupMember('group-id', 'other-id', database), false)
+  assert.match(database.calls[0].text, /JOIN groups g ON g\.id = gm\.group_id AND g\.status = 'active'/)
+  assert.match(database.calls[0].text, /JOIN users u ON u\.id = gm\.user_id AND u\.status = 'active'/)
+  assert.deepEqual(database.calls.map(({ values }) => values), [
+    ['group-id', 'member-id'],
+    ['group-id', 'other-id'],
+  ])
 })
 
 test('rolls back group creation if owner membership cannot be created', async () => {

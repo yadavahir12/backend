@@ -565,6 +565,18 @@ export async function getGroup(groupId, database = pool) {
   return mapGroup(result.rows[0])
 }
 
+export async function isGroupMember(groupId, userId, database = pool) {
+  const result = await database.query(
+    `SELECT 1
+     FROM group_members gm
+     JOIN groups g ON g.id = gm.group_id AND g.status = 'active'
+     JOIN users u ON u.id = gm.user_id AND u.status = 'active'
+     WHERE gm.group_id = $1 AND gm.user_id = $2`,
+    [groupId, userId],
+  )
+  return Boolean(result.rows[0])
+}
+
 export async function createGroup({ id = randomUUID(), name, icon = null, ownerId, visibility = 'public' }, database = pool) {
   return withTransaction(async (client) => {
     const inserted = await client.query(

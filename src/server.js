@@ -24,6 +24,7 @@ import {
   getGroup as getPersistentGroup,
   getGroups as getPersistentGroups,
   getGroupMessages as getPersistentGroupMessages,
+  isGroupMember as isPersistentGroupMember,
   joinGroup as joinPersistentGroup,
   markNotificationsRead as markPersistentNotificationsRead,
   getWallet as getPersistentWallet,
@@ -422,7 +423,34 @@ app.get('/api/admin/stats', { preHandler: requireAdmin }, async () => ({
 }))
 
 io.use((socket, next) => { try { const token = socket.handshake.auth?.token; socket.user = jwt.verify(token, config.JWT_SECRET); next() } catch { next(new Error('Unauthorized')) } })
-io.on('connection', (socket) => { socket.on('group.join', (groupId) => socket.join(`group:${groupId}`)); socket.on('group.leave', (groupId) => socket.leave(`group:${groupId}`)); socket.on('typing', ({ groupId, typing }) => socket.to(`group:${groupId}`).emit('typing', { userId: socket.user.sub, typing })) })
+io.on('connection', (socket) => {
+  socket.on('group.join', async (groupId, acknowledge) => {
+    const respond = typeof acknowledge === 'function' ? acknowledge : () => {}
+    try {
+      const authorized = typeof groupId === 'string' && (demoMode
+        ? state.users.some((user) => user.id === socket.user.sub && user.status === 'active')
+          && state.groups.find((group) => group.id === groupId)?.members?.some((member) => member.userId === socket.user.sub || member.id === socket.user.sub)
+        : isUuid(groupId) && await isPersistentGroupMember(groupId, socket.user.sub))
+      if (!authorized) {
+        respond({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+        return
+      }
+      await socket.join(`group:${groupId}`)
+      respond({ success: true })
+    } catch (error) {
+      app.log.error(error, 'Unable to authorize Socket.IO group join')
+      respond({ success: false, error: { code: 'INTERNAL', message: 'Unable to join group' } })
+    }
+  })
+  socket.on('group.leave', (groupId) => {
+    if (typeof groupId === 'string') socket.leave(`group:${groupId}`)
+  })
+  socket.on('typing', ({ groupId, typing } = {}) => {
+    if (typeof groupId === 'string' && socket.rooms.has(`group:${groupId}`)) {
+      socket.to(`group:${groupId}`).emit('typing', { userId: socket.user.sub, typing })
+    }
+  })
+})
 
 const port = Number(config.PORT)
 await app.listen({ port, host: '0.0.0.0' })
