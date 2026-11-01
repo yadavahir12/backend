@@ -22,6 +22,8 @@ npm start
 
 Set `DEMO_MODE=false` and a valid `DATABASE_URL` before using a durable environment. The schema is in `schema.sql`; migrations require a configured PostgreSQL connection through `npm run migrate`.
 
+For an existing deployment, run `npm run migrate` with `DATABASE_URL_UNPOOLED` set to the direct PostgreSQL connection string before deploying the chat API changes. This applies `migrations/20261101_add_message_reply_reference.sql` transactionally and records it in `schema_migrations`; the migration adds nullable UUID reply references and the message deletion timestamp without removing existing messages.
+
 Demo login:
 
 - Username: `@alexm`

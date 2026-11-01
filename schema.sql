@@ -6,15 +6,8 @@ CREATE TABLE IF NOT EXISTS coin_transactions (id UUID PRIMARY KEY, user_id UUID 
 CREATE TABLE IF NOT EXISTS coin_packages (id UUID PRIMARY KEY, amount_inr INTEGER NOT NULL, coin_amount INTEGER NOT NULL, display_order INTEGER NOT NULL, is_active BOOLEAN NOT NULL DEFAULT true, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS groups (id UUID PRIMARY KEY, name TEXT NOT NULL, icon_url TEXT, owner_id UUID NOT NULL REFERENCES users(id), visibility TEXT NOT NULL DEFAULT 'public', status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS group_members (group_id UUID REFERENCES groups(id) ON DELETE CASCADE, user_id UUID REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL DEFAULT 'member', last_read_message_id UUID, joined_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (group_id, user_id));
-CREATE TABLE IF NOT EXISTS messages (id UUID PRIMARY KEY, group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE, sender_id UUID NOT NULL REFERENCES users(id), text TEXT NOT NULL, emoji TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), deleted_at TIMESTAMPTZ, reply_to_message_id UUID);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_message_id UUID;
+CREATE TABLE IF NOT EXISTS messages (id UUID PRIMARY KEY, group_id UUID NOT NULL REFERENCES groups(id) ON DELETE CASCADE, sender_id UUID NOT NULL REFERENCES users(id), text TEXT NOT NULL, emoji TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), deleted_at TIMESTAMPTZ, reply_to_message_id UUID CONSTRAINT messages_reply_to_message_id_fkey REFERENCES messages(id) ON DELETE SET NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS messages_id_group_idx ON messages(id, group_id);
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'messages_reply_same_group_fk' AND conrelid = 'messages'::regclass) THEN
-    ALTER TABLE messages ADD CONSTRAINT messages_reply_same_group_fk
-      FOREIGN KEY (reply_to_message_id, group_id) REFERENCES messages(id, group_id);
-  END IF;
-END $$;
 CREATE TABLE IF NOT EXISTS follows (follower_id UUID REFERENCES users(id) ON DELETE CASCADE, following_id UUID REFERENCES users(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (follower_id, following_id), CHECK (follower_id <> following_id));
 CREATE TABLE IF NOT EXISTS achievements (id UUID PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT NOT NULL, criteria JSONB NOT NULL DEFAULT '{}'::jsonb, is_active BOOLEAN NOT NULL DEFAULT true);
 CREATE TABLE IF NOT EXISTS user_achievements (user_id UUID REFERENCES users(id) ON DELETE CASCADE, achievement_id UUID REFERENCES achievements(id) ON DELETE CASCADE, unlocked_at TIMESTAMPTZ NOT NULL DEFAULT now(), progress INTEGER NOT NULL DEFAULT 100, PRIMARY KEY (user_id, achievement_id));

@@ -15,8 +15,25 @@ const client = await pool.connect()
 try {
   await client.query('BEGIN')
   await client.query(await fs.readFile(new URL('../schema.sql', import.meta.url), 'utf8'))
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+       name TEXT PRIMARY KEY,
+       applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
+  )
+  const migrationDirectory = new URL('../migrations/', import.meta.url)
+  const migrationFiles = (await fs.readdir(migrationDirectory))
+    .filter((name) => name.endsWith('.sql'))
+    .sort()
+  for (const name of migrationFiles) {
+    const applied = await client.query('SELECT 1 FROM schema_migrations WHERE name = $1', [name])
+    if (applied.rows[0]) continue
+    await client.query(await fs.readFile(new URL(name, migrationDirectory), 'utf8'))
+    await client.query('INSERT INTO schema_migrations (name) VALUES ($1)', [name])
+    console.log(`Applied migration ${name}`)
+  }
   await client.query('COMMIT')
-  console.log('Database schema applied')
+  console.log('Database schema and migrations applied')
 } catch (error) {
   try {
     await client.query('ROLLBACK')
