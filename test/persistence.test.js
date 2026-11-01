@@ -4,6 +4,7 @@ import {
   adjustWallet,
   createGroup,
   createMessage,
+  deleteMessage,
   createPrediction,
   createUser,
   followUser,
@@ -14,6 +15,7 @@ import {
   getGroup,
   getGroupMessages,
   getGroups,
+  getProfileByUsername,
   isGroupMember,
   getNotifications,
   getPersistentLeaderboard,
@@ -324,17 +326,21 @@ test('rolls back group creation if owner membership cannot be created', async ()
 })
 
 test('reads and creates messages with sender names and parameterized values', async () => {
-  const row = { id: 'message-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player', text: 'Hello', emoji: null, created_at: 'created' }
-  const database = createFakePool([[row], row])
+  const row = { id: 'message-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player', sender_username: 'player', sender_avatar_url: null, text: 'Hello', emoji: null, created_at: 'created', deleted_at: null, reply_to_message_id: null }
+  const database = createFakePool([[row], undefined, row])
 
   assert.deepEqual(await getGroupMessages('group-id', database), [{
     id: 'message-id',
     groupId: 'group-id',
     senderId: 'user-id',
     senderName: 'Player',
+    senderUsername: 'player',
+    senderAvatarUrl: null,
     text: 'Hello',
     emoji: null,
     createdAt: 'created',
+    deletedAt: null,
+    replyTo: null,
   }])
   assert.deepEqual(database.calls[0].values, ['group-id'])
   assert.deepEqual(await createMessage({ id: 'message-id', groupId: 'group-id', senderId: 'user-id', text: 'Hello' }, database), {
@@ -342,11 +348,94 @@ test('reads and creates messages with sender names and parameterized values', as
     groupId: 'group-id',
     senderId: 'user-id',
     senderName: 'Player',
+    senderUsername: 'player',
+    senderAvatarUrl: null,
     text: 'Hello',
     emoji: null,
     createdAt: 'created',
+    deletedAt: null,
+    replyTo: null,
   })
-  assert.deepEqual(database.calls[1].values, ['message-id', 'group-id', 'user-id', 'Hello', null])
+  assert.deepEqual(database.calls[2].values, ['message-id', 'group-id', 'user-id', 'Hello', null, null])
+  assert.deepEqual(database.calls[3].values, ['message-id'])
+})
+
+test('persists replies only to messages in the same group', async () => {
+  const row = {
+    id: 'reply-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player',
+    sender_username: 'player', text: 'A reply', emoji: null, created_at: 'created',
+    reply_to_message_id: 'original-id', reply_sender_name: 'Other', reply_text: 'Original',
+  }
+  const database = createFakePool([{ id: 'original-id' }, undefined, row])
+  const result = await createMessage({
+    id: 'reply-id', groupId: 'group-id', senderId: 'user-id', text: 'A reply', replyToMessageId: 'original-id',
+  }, database)
+
+  assert.deepEqual(result.replyTo, {
+    id: 'original-id',
+    senderName: 'Other',
+    text: 'Original',
+    emoji: null,
+    deletedAt: null,
+  })
+  assert.deepEqual(database.calls[2].values, ['reply-id', 'group-id', 'user-id', 'A reply', null, 'original-id'])
+
+  const invalidDatabase = createFakePool([])
+  await assert.rejects(() => createMessage({
+    groupId: 'group-id', senderId: 'user-id', text: 'A reply', replyToMessageId: 'other-group-message',
+  }, invalidDatabase), /INVALID_REPLY_REFERENCE/)
+  assert.equal(invalidDatabase.calls.at(-1).text, 'ROLLBACK')
+})
+
+test('soft-deletes a message only for its original sender', async () => {
+  const deletedRow = {
+    id: 'message-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player',
+    sender_username: 'player', text: 'This message was deleted', emoji: null,
+    created_at: 'created', deleted_at: 'deleted',
+  }
+  const database = createFakePool([
+    { sender_id: 'user-id', deleted_at: null },
+    undefined,
+    deletedRow,
+  ])
+  const deleted = await deleteMessage({ messageId: 'message-id', groupId: 'group-id', senderId: 'user-id' }, database)
+  assert.equal(deleted.text, 'This message was deleted')
+  assert.equal(deleted.deletedAt, 'deleted')
+  assert.match(database.calls[2].text, /SET deleted_at = now\(\), text = '', emoji = NULL/)
+
+  const unauthorizedDatabase = createFakePool([{ sender_id: 'another-user', deleted_at: null }])
+  await assert.rejects(
+    () => deleteMessage({ messageId: 'message-id', groupId: 'group-id', senderId: 'user-id' }, unauthorizedDatabase),
+    /MESSAGE_FORBIDDEN/,
+  )
+  assert.equal(unauthorizedDatabase.calls.at(-1).text, 'ROLLBACK')
+})
+
+test('returns only public profile fields and follower counts', async () => {
+  const database = createFakePool([{
+    id: 'user-id',
+    username: 'player',
+    display_name: 'Player Name',
+    bio: 'Hello',
+    avatar_url: 'https://example.test/avatar.png',
+    level: 4,
+    experience: 230,
+    followers: 12,
+    following: 8,
+  }])
+  assert.deepEqual(await getProfileByUsername('player', database), {
+    user: { id: 'user-id', username: 'player', displayName: 'Player Name' },
+    profile: {
+      userId: 'user-id',
+      displayName: 'Player Name',
+      bio: 'Hello',
+      avatarUrl: 'https://example.test/avatar.png',
+      level: 4,
+      experience: 230,
+      followers: 12,
+      following: 8,
+    },
+  })
 })
 
 test('returns the active persisted round or creates the next round safely', async () => {

@@ -42,6 +42,10 @@ Do not use these credentials outside local development.
 - `/api/notifications/*`
 - `/api/admin/*`
 
+Group messages accept an optional `replyToMessageId` that must reference a message in the same group. `DELETE /api/groups/:id/messages/:messageId` deletes a message for everyone; only its sender can perform this operation. Deleted messages remain in history as “This message was deleted,” and their reply previews update accordingly. Group members receive `message.created` and `message.deleted` Socket.IO events.
+
+Public profile responses expose display name, username, avatar, bio, level, and follower/following counts; they do not include email or wallet data.
+
 In PostgreSQL mode, game rounds and predictions, follows, notifications, and group memberships use their existing tables. `POST /api/groups/:id/join` joins an active public group; private groups cannot be joined through this endpoint. Coin entry debits and prediction creation are committed together. Game-result settlement and notification creation are not implemented yet.
 
 Socket.IO events currently include `group.join`, `group.leave`, `typing`, and server-emitted `message.created`.

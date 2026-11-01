@@ -12,6 +12,7 @@ import {
   createPrediction as createPersistentPrediction,
   createGroup as createPersistentGroup,
   createMessage as createPersistentMessage,
+  deleteMessage as deletePersistentMessage,
   followUser as followPersistentUser,
   getAdminStats as getPersistentAdminStats,
   getCurrentGameRound,
@@ -41,6 +42,7 @@ import {
 const app = Fastify({ logger: true })
 const corsOrigins = [...new Set([
   config.CLIENT_URL,
+  'https://win-chat-frontend-pearl.vercel.app',
   'https://win-chat-frontend-beta.vercel.app',
   'https://win-chat-frontend.vercel.app',
   'https://win-chat-frontend-two.vercel.app',
@@ -143,9 +145,25 @@ app.get('/api/users/:username/profile', async (request, reply) => {
     if (!profile) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } })
     return { success: true, data: profile }
   }
-  const user = state.users.find((item) => item.username === request.params.username)
+  const user = state.users.find((item) => item.username.toLowerCase() === request.params.username.toLowerCase())
   if (!user) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'User not found' } })
-  return { success: true, data: { user: publicUser(user), profile: state.profiles.find((item) => item.userId === user.id), wallet: state.wallets.find((item) => item.userId === user.id) } }
+  const profile = state.profiles.find((item) => item.userId === user.id)
+  return {
+    success: true,
+    data: {
+      user: { id: user.id, username: user.username, displayName: user.displayName },
+      profile: {
+        userId: user.id,
+        displayName: profile?.displayName || user.displayName,
+        bio: profile?.bio || '',
+        avatarUrl: profile?.avatarUrl || null,
+        level: profile?.level || 1,
+        experience: profile?.experience || 0,
+        followers: state.follows.filter((follow) => follow.followingId === user.id).length,
+        following: state.follows.filter((follow) => follow.followerId === user.id).length,
+      },
+    },
+  }
 })
 app.patch('/api/users/me', { preHandler: requireAuth }, async (request, reply) => {
   const { displayName, username, bio } = request.body || {}
@@ -276,35 +294,127 @@ app.get('/api/groups/:id', { preHandler: requireAuth }, async (request, reply) =
 })
 app.get('/api/groups/:id/messages', { preHandler: requireAuth }, async (request, reply) => {
   if (demoMode) {
-    if (!state.groups.some((item) => item.id === request.params.id)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
-    return { success: true, data: state.messages.filter((item) => item.groupId === request.params.id) }
+    const group = state.groups.find((item) => item.id === request.params.id)
+    if (!group) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
+    if (!group.members?.some((member) => member.userId === request.user.id || member.id === request.user.id)) {
+      return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+    }
+    return {
+      success: true,
+      data: state.messages.filter((item) => item.groupId === request.params.id).map((message) => {
+        if (!message.replyToMessageId) return message
+        const original = state.messages.find((item) => item.id === message.replyToMessageId && item.groupId === request.params.id)
+        if (!original) return message
+        return {
+          ...message,
+          replyTo: {
+            id: original.id,
+            senderName: original.senderName,
+            text: original.deletedAt ? 'This message was deleted' : original.text,
+            emoji: original.deletedAt ? null : original.emoji || null,
+            deletedAt: original.deletedAt || null,
+          },
+        }
+      }),
+    }
   }
   if (!isUuid(request.params.id)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
   if (!await getPersistentGroup(request.params.id)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
+  if (!await isPersistentGroupMember(request.params.id, request.user.id)) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
   return { success: true, data: await getPersistentGroupMessages(request.params.id) }
 })
 app.post('/api/groups/:id/messages', { preHandler: requireAuth }, async (request, reply) => {
   const text = String(request.body?.text || '').trim()
   if (!text || text.length > 2000) return reply.code(400).send({ success: false, error: { code: 'INVALID_MESSAGE', message: 'Message must be 1-2000 characters' } })
+  const replyToMessageId = request.body?.replyToMessageId || null
   if (!demoMode) {
     if (!isUuid(request.params.id) || !await getPersistentGroup(request.params.id)) {
       return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
     }
-    const message = await createPersistentMessage({
-      id: randomUUID(),
-      groupId: request.params.id,
-      senderId: request.user.id,
-      text,
-      emoji: request.body?.emoji || null,
-    })
+    if (!await isPersistentGroupMember(request.params.id, request.user.id)) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+    if (replyToMessageId && !isUuid(replyToMessageId)) return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target is invalid' } })
+    let message
+    try {
+      message = await createPersistentMessage({
+        id: randomUUID(),
+        groupId: request.params.id,
+        senderId: request.user.id,
+        text,
+        emoji: request.body?.emoji || null,
+        replyToMessageId,
+      })
+    } catch (error) {
+      if (error.message === 'INVALID_REPLY_REFERENCE') return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target must be in this chat' } })
+      throw error
+    }
     io.to(`group:${request.params.id}`).emit('message.created', message)
     return reply.code(201).send({ success: true, data: message })
   }
-  if (!state.groups.some((item) => item.id === request.params.id)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
-  const message = { id: randomUUID(), groupId: request.params.id, senderId: request.user.id, senderName: request.user.displayName, text, emoji: request.body?.emoji || null, createdAt: now() }
+  const group = state.groups.find((item) => item.id === request.params.id)
+  if (!group) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
+  if (!group.members?.some((member) => member.userId === request.user.id || member.id === request.user.id)) {
+    return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+  }
+  const original = replyToMessageId && state.messages.find((item) => item.id === replyToMessageId && item.groupId === request.params.id)
+  if (replyToMessageId && !original) return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target must be in this chat' } })
+  const message = {
+    id: randomUUID(),
+    groupId: request.params.id,
+    senderId: request.user.id,
+    senderName: request.user.displayName,
+    senderUsername: request.user.username,
+    senderAvatarUrl: state.profiles.find((item) => item.userId === request.user.id)?.avatarUrl || null,
+    text,
+    emoji: request.body?.emoji || null,
+    createdAt: now(),
+    deletedAt: null,
+    replyTo: original ? {
+      id: original.id,
+      senderName: original.senderName,
+      text: original.deletedAt ? 'This message was deleted' : original.text,
+      emoji: original.deletedAt ? null : original.emoji || null,
+      deletedAt: original.deletedAt || null,
+    } : null,
+  }
+  message.replyToMessageId = replyToMessageId
   state.messages.push(message)
   io.to(`group:${request.params.id}`).emit('message.created', message)
   return reply.code(201).send({ success: true, data: message })
+})
+app.delete('/api/groups/:id/messages/:messageId', { preHandler: requireAuth }, async (request, reply) => {
+  const { id: groupId, messageId } = request.params
+  if (!demoMode && (!isUuid(groupId) || !isUuid(messageId))) {
+    return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Message not found' } })
+  }
+  let message
+  if (demoMode) {
+    const group = state.groups.find((item) => item.id === groupId)
+    if (!group) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
+    if (!group.members?.some((member) => member.userId === request.user.id || member.id === request.user.id)) {
+      return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+    }
+    const existing = state.messages.find((item) => item.id === messageId && item.groupId === groupId)
+    if (!existing) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Message not found' } })
+    if (existing.senderId !== request.user.id) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'You can only delete your own messages' } })
+    if (!existing.deletedAt) {
+      existing.text = 'This message was deleted'
+      existing.emoji = null
+      existing.deletedAt = now()
+    }
+    message = existing
+  } else {
+    if (!await getPersistentGroup(groupId)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
+    if (!await isPersistentGroupMember(groupId, request.user.id)) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
+    try {
+      message = await deletePersistentMessage({ messageId, groupId, senderId: request.user.id })
+    } catch (error) {
+      if (error.message === 'MESSAGE_FORBIDDEN') return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'You can only delete your own messages' } })
+      throw error
+    }
+    if (!message) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Message not found' } })
+  }
+  io.to(`group:${groupId}`).emit('message.deleted', message)
+  return { success: true, data: message }
 })
 app.get('/api/game/rounds/current', async () => {
   if (!demoMode) return { success: true, data: await getCurrentGameRound(GAME_COLORS) }

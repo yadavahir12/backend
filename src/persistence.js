@@ -71,14 +71,26 @@ export function mapGroup(row) {
 
 export function mapMessage(row) {
   if (!row) return null
+  const deletedAt = row.deleted_at ?? row.deletedAt ?? null
+  const replyToMessageId = row.reply_to_message_id ?? row.replyToMessageId ?? null
   return {
     id: row.id,
     groupId: row.group_id ?? row.groupId,
     senderId: row.sender_id ?? row.senderId,
     senderName: row.sender_name ?? row.senderName,
-    text: row.text,
-    emoji: row.emoji ?? null,
+    senderUsername: row.sender_username ?? row.senderUsername ?? null,
+    senderAvatarUrl: row.sender_avatar_url ?? row.senderAvatarUrl ?? null,
+    text: deletedAt ? 'This message was deleted' : row.text,
+    emoji: deletedAt ? null : row.emoji ?? null,
     createdAt: row.created_at ?? row.createdAt,
+    deletedAt,
+    replyTo: replyToMessageId ? {
+      id: replyToMessageId,
+      senderName: row.reply_sender_name ?? null,
+      text: row.reply_text ?? '',
+      emoji: row.reply_emoji ?? null,
+      deletedAt: row.reply_deleted_at ?? null,
+    } : null,
   }
 }
 
@@ -211,15 +223,29 @@ export async function getMyProfile(userId, database = pool) {
 
 export async function getProfileByUsername(username, database = pool) {
   const userResult = await database.query(
-    `SELECT u.id, u.username, u.email, u.role, u.status, p.display_name
+    `SELECT u.id, u.username, p.display_name, p.bio, p.avatar_url, p.level, p.experience,
+            (SELECT count(*)::int FROM follows f WHERE f.following_id = u.id) AS followers,
+            (SELECT count(*)::int FROM follows f WHERE f.follower_id = u.id) AS following
      FROM users u
      LEFT JOIN profiles p ON p.user_id = u.id
-     WHERE lower(u.username) = lower($1)`,
+     WHERE lower(u.username) = lower($1) AND u.status = 'active'`,
     [username],
   )
   const user = userResult.rows[0]
   if (!user) return null
-  return getMyProfile(user.id, database)
+  return {
+    user: { id: user.id, username: user.username, displayName: user.display_name },
+    profile: {
+      userId: user.id,
+      displayName: user.display_name || user.username,
+      bio: user.bio || '',
+      avatarUrl: user.avatar_url || null,
+      level: user.level,
+      experience: user.experience,
+      followers: user.followers,
+      following: user.following,
+    },
+  }
 }
 
 export async function updateProfile(userId, { username, displayName, bio }, database = pool) {
@@ -625,33 +651,68 @@ export async function joinGroup(groupId, userId, database = pool) {
 
 export async function getGroupMessages(groupId, database = pool) {
   const result = await database.query(
-    `SELECT m.id, m.group_id, m.sender_id,
-            COALESCE(p.display_name, u.username) AS sender_name,
-            m.text, m.emoji, m.created_at
-     FROM messages m
-     JOIN users u ON u.id = m.sender_id
-     LEFT JOIN profiles p ON p.user_id = u.id
-     WHERE m.group_id = $1 AND m.deleted_at IS NULL
-     ORDER BY m.created_at ASC`,
+    `${messageSelect} WHERE m.group_id = $1 ORDER BY m.created_at ASC`,
     [groupId],
   )
   return result.rows.map(mapMessage)
 }
 
-export async function createMessage({ id = randomUUID(), groupId, senderId, text, emoji = null }, database = pool) {
-  const result = await database.query(
-    `WITH inserted AS (
-       INSERT INTO messages (id, group_id, sender_id, text, emoji)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, group_id, sender_id, text, emoji, created_at
-     )
-     SELECT i.id, i.group_id, i.sender_id,
-            COALESCE(p.display_name, u.username) AS sender_name,
-            i.text, i.emoji, i.created_at
-     FROM inserted i
-     JOIN users u ON u.id = i.sender_id
-     LEFT JOIN profiles p ON p.user_id = u.id`,
-    [id, groupId, senderId, text, emoji],
-  )
-  return mapMessage(result.rows[0])
+const messageSelect = `SELECT m.id, m.group_id, m.sender_id,
+       COALESCE(p.display_name, u.username) AS sender_name,
+       u.username AS sender_username, p.avatar_url AS sender_avatar_url,
+       CASE WHEN m.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE m.text END AS text,
+       m.emoji, m.created_at, m.deleted_at, m.reply_to_message_id,
+       COALESCE(rp.display_name, ru.username) AS reply_sender_name,
+       CASE WHEN r.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE r.text END AS reply_text,
+       r.emoji AS reply_emoji, r.deleted_at AS reply_deleted_at
+     FROM messages m
+     JOIN users u ON u.id = m.sender_id
+     LEFT JOIN profiles p ON p.user_id = u.id
+     LEFT JOIN messages r ON r.id = m.reply_to_message_id AND r.group_id = m.group_id
+     LEFT JOIN users ru ON ru.id = r.sender_id
+     LEFT JOIN profiles rp ON rp.user_id = ru.id`
+
+export async function createMessage({ id = randomUUID(), groupId, senderId, text, emoji = null, replyToMessageId = null }, database = pool) {
+  return withTransaction(async (client) => {
+    if (replyToMessageId) {
+      const original = await client.query(
+        'SELECT id FROM messages WHERE id = $1 AND group_id = $2',
+        [replyToMessageId, groupId],
+      )
+      if (!original.rows[0]) throw new Error('INVALID_REPLY_REFERENCE')
+    }
+    await client.query(
+      `INSERT INTO messages (id, group_id, sender_id, text, emoji, reply_to_message_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [id, groupId, senderId, text, emoji, replyToMessageId],
+    )
+    const result = await client.query(`${messageSelect} WHERE m.id = $1`, [id])
+    return mapMessage(result.rows[0])
+  }, database)
+}
+
+export async function deleteMessage({ messageId, groupId, senderId }, database = pool) {
+  return withTransaction(async (client) => {
+    const existing = await client.query(
+      `SELECT sender_id, deleted_at
+       FROM messages WHERE id = $1 AND group_id = $2
+       FOR UPDATE`,
+      [messageId, groupId],
+    )
+    const message = existing.rows[0]
+    if (!message) return null
+    if (String(message.sender_id).toLowerCase() !== String(senderId).toLowerCase()) {
+      throw new Error('MESSAGE_FORBIDDEN')
+    }
+    if (!message.deleted_at) {
+      await client.query(
+        `UPDATE messages
+         SET deleted_at = now(), text = '', emoji = NULL
+         WHERE id = $1 AND group_id = $2 AND sender_id = $3`,
+        [messageId, groupId, senderId],
+      )
+    }
+    const result = await client.query(`${messageSelect} WHERE m.id = $1`, [messageId])
+    return mapMessage(result.rows[0])
+  }, database)
 }
