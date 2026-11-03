@@ -127,3 +127,40 @@ test('an empty OWNER_EMAIL denies owner status and admin API access', async () =
     await stopBackend(backend.child)
   }
 })
+
+test('game results require authentication, belong to the requesting player, and stay pending until settled', async () => {
+  const backend = await startBackend('')
+  try {
+    const login = await apiRequest(backend.baseUrl, '/api/auth/login', {
+      method: 'POST',
+      body: { username: 'alex@example.com', password: 'demo-password' },
+    })
+    assert.equal(login.status, 200)
+    const token = login.body.data.token
+    const roundResponse = await apiRequest(backend.baseUrl, '/api/game/rounds/current')
+    const roundId = roundResponse.body.data.id
+    const submitted = await apiRequest(backend.baseUrl, `/api/game/rounds/${roundId}/predictions`, {
+      token,
+      method: 'POST',
+      body: { color: 'Green', amount: 50 },
+    })
+    assert.equal(submitted.status, 201)
+    const predictionId = submitted.body.data.id
+    const path = `/api/game/predictions/${predictionId}/result`
+
+    assert.equal((await apiRequest(backend.baseUrl, path)).status, 401)
+    const result = await apiRequest(backend.baseUrl, path, { token })
+    assert.equal(result.status, 200)
+    assert.equal(result.body.data.status, 'pending')
+    assert.equal(result.body.data.result, null)
+
+    const otherRegistration = await apiRequest(backend.baseUrl, '/api/auth/register', {
+      method: 'POST',
+      body: { username: 'other-player', email: 'other@example.com', password: 'other-test-password' },
+    })
+    assert.equal(otherRegistration.status, 201)
+    assert.equal((await apiRequest(backend.baseUrl, path, { token: otherRegistration.body.data.token })).status, 404)
+  } finally {
+    await stopBackend(backend.child)
+  }
+})

@@ -11,6 +11,7 @@ import {
   getAdminStats,
   getCurrentGameRound,
   getFollowStatus,
+  getGameResult,
   getGameHistory,
   getGroup,
   getGroupMessages,
@@ -580,6 +581,36 @@ test('reads game history and persistent leaderboard statistics', async () => {
     createdAt: 'created',
   }])
   assert.deepEqual(historyDatabase.calls[0].values, ['user-id'])
+  assert.match(historyDatabase.calls[0].text, /JOIN game_rounds gr ON gr\.id = gp\.round_id/)
+
+  const resultDatabase = createFakePool([{
+    id: 'prediction-id',
+    user_id: 'user-id',
+    round_id: 'round-id',
+    round_number: '2050',
+    selected_color: 'Green',
+    virtual_coin_amount: 12,
+    status: 'won',
+    reward: 24,
+    created_at: 'created',
+    round_result: 'Green',
+    round_status: 'completed',
+  }])
+  assert.deepEqual(await getGameResult('prediction-id', 'user-id', resultDatabase), {
+    id: 'prediction-id',
+    userId: 'user-id',
+    roundId: 'round-id',
+    roundNumber: 2050,
+    selectedColor: 'Green',
+    virtualCoinAmount: 12,
+    status: 'won',
+    reward: 24,
+    createdAt: 'created',
+    result: 'Green',
+    roundStatus: 'completed',
+  })
+  assert.deepEqual(resultDatabase.calls[0].values, ['prediction-id', 'user-id'])
+  assert.match(resultDatabase.calls[0].text, /WHERE gp\.id = \$1 AND gp\.user_id = \$2/)
 
   const statsDatabase = createFakePool([{ id: 'user-id', username: 'player', wins: 2, games: 5 }])
   assert.deepEqual(await getPersistentLeaderboard('total_wins', statsDatabase), [{ id: 'user-id', username: 'player', wins: 2, games: 5 }])

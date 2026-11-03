@@ -17,6 +17,7 @@ import {
   followUser as followPersistentUser,
   getAdminStats as getPersistentAdminStats,
   getCurrentGameRound,
+  getGameResult as getPersistentGameResult,
   getGameRound,
   getFollowStatus as getPersistentFollowStatus,
   getGameHistory,
@@ -483,6 +484,23 @@ app.get('/api/games/history', { preHandler: requireAuth }, async (request) => ({
   success: true,
   data: demoMode ? state.predictions.filter((item) => item.userId === request.user.id) : await getGameHistory(request.user.id),
 }))
+app.get('/api/game/predictions/:id/result', { preHandler: requireAuth }, async (request, reply) => {
+  if (!isUuid(request.params.id)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Game result not found' } })
+  const prediction = demoMode
+    ? state.predictions.find((item) => item.id === request.params.id && item.userId === request.user.id)
+    : await getPersistentGameResult(request.params.id, request.user.id)
+  if (!prediction) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Game result not found' } })
+  const round = demoMode ? state.rounds.find((item) => item.id === prediction.roundId) : null
+  const data = demoMode
+    ? {
+      ...prediction,
+      roundNumber: round?.roundNumber ?? null,
+      result: round?.result ?? null,
+      roundStatus: round?.status ?? null,
+    }
+    : prediction
+  return { success: true, data }
+})
 app.get('/api/leaderboard', async (request) => {
   if (request.query.metric === 'coins') {
     if (!demoMode) {

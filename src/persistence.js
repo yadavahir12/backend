@@ -109,15 +109,21 @@ export function mapGameRound(row) {
 
 export function mapPrediction(row) {
   if (!row) return null
+  const roundNumber = row.round_number ?? row.roundNumber
+  const result = Object.hasOwn(row, 'round_result') ? row.round_result : row.result
+  const roundStatus = Object.hasOwn(row, 'round_status') ? row.round_status : row.roundStatus
   return {
     id: row.id,
     userId: row.user_id ?? row.userId,
     roundId: row.round_id ?? row.roundId,
+    ...(roundNumber == null ? {} : { roundNumber: Number(roundNumber) }),
     selectedColor: row.selected_color ?? row.selectedColor,
     virtualCoinAmount: row.virtual_coin_amount ?? row.virtualCoinAmount,
     status: row.status,
     reward: row.reward ?? 0,
     createdAt: row.created_at ?? row.createdAt,
+    ...(result === undefined ? {} : { result }),
+    ...(roundStatus === undefined ? {} : { roundStatus }),
   }
 }
 
@@ -460,13 +466,29 @@ export async function createPrediction({ id = randomUUID(), userId, roundId, col
 
 export async function getGameHistory(userId, database = pool) {
   const result = await database.query(
-    `SELECT id, user_id, round_id, selected_color, virtual_coin_amount, status, reward, created_at
-     FROM game_predictions
-     WHERE user_id = $1
-     ORDER BY created_at DESC`,
+    `SELECT gp.id, gp.user_id, gp.round_id, gr.round_number, gp.selected_color,
+            gp.virtual_coin_amount, gp.status, gp.reward, gp.created_at,
+            gr.result AS round_result, gr.status AS round_status
+     FROM game_predictions gp
+     JOIN game_rounds gr ON gr.id = gp.round_id
+     WHERE gp.user_id = $1
+     ORDER BY gp.created_at DESC`,
     [userId],
   )
   return result.rows.map(mapPrediction)
+}
+
+export async function getGameResult(predictionId, userId, database = pool) {
+  const result = await database.query(
+    `SELECT gp.id, gp.user_id, gp.round_id, gr.round_number, gp.selected_color,
+            gp.virtual_coin_amount, gp.status, gp.reward, gp.created_at,
+            gr.result AS round_result, gr.status AS round_status
+     FROM game_predictions gp
+     JOIN game_rounds gr ON gr.id = gp.round_id
+     WHERE gp.id = $1 AND gp.user_id = $2`,
+    [predictionId, userId],
+  )
+  return mapPrediction(result.rows[0])
 }
 
 export async function followUser(followerId, followingId, database = pool) {
