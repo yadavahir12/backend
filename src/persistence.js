@@ -681,13 +681,26 @@ export async function createMessage({ id = randomUUID(), groupId, senderId, text
       )
       if (!original.rows[0]) throw new Error('INVALID_REPLY_REFERENCE')
     }
-    await client.query(
+    const inserted = await client.query(
       `INSERT INTO messages (id, group_id, sender_id, text, emoji, reply_to_message_id)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO NOTHING
+       RETURNING id`,
       [id, groupId, senderId, text, emoji, replyToMessageId],
     )
+    const created = Boolean(inserted.rows[0])
+    if (!created) {
+      const existing = await client.query(
+        'SELECT group_id, sender_id FROM messages WHERE id = $1 FOR UPDATE',
+        [id],
+      )
+      if (
+        String(existing.rows[0]?.group_id).toLowerCase() !== String(groupId).toLowerCase()
+        || String(existing.rows[0]?.sender_id).toLowerCase() !== String(senderId).toLowerCase()
+      ) throw new Error('MESSAGE_ID_CONFLICT')
+    }
     const result = await client.query(`${messageSelect} WHERE m.id = $1`, [id])
-    return mapMessage(result.rows[0])
+    return { message: mapMessage(result.rows[0]), created }
   }, database)
 }
 

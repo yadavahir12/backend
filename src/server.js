@@ -327,6 +327,9 @@ app.post('/api/groups/:id/messages', { preHandler: requireAuth }, async (request
   const text = String(request.body?.text || '').trim()
   if (!text || text.length > 2000) return reply.code(400).send({ success: false, error: { code: 'INVALID_MESSAGE', message: 'Message must be 1-2000 characters' } })
   const replyToMessageId = request.body?.replyToMessageId || null
+  const clientMessageId = request.body?.clientMessageId || null
+  if (clientMessageId && !isUuid(clientMessageId)) return reply.code(400).send({ success: false, error: { code: 'INVALID_MESSAGE_ID', message: 'Client message ID must be a UUID' } })
+  let created = true
   if (!demoMode) {
     if (!isUuid(request.params.id) || !await getPersistentGroup(request.params.id)) {
       return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
@@ -335,30 +338,42 @@ app.post('/api/groups/:id/messages', { preHandler: requireAuth }, async (request
     if (replyToMessageId && !isUuid(replyToMessageId)) return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target is invalid' } })
     let message
     try {
-      message = await createPersistentMessage({
-        id: randomUUID(),
+      const result = await createPersistentMessage({
+        id: clientMessageId || randomUUID(),
         groupId: request.params.id,
         senderId: request.user.id,
         text,
         emoji: request.body?.emoji || null,
         replyToMessageId,
       })
+      message = result.message
+      created = result.created
+      if (created) io.to(`group:${request.params.id}`).emit('message.created', message)
     } catch (error) {
       if (error.message === 'INVALID_REPLY_REFERENCE') return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target must be in this chat' } })
+      if (error.message === 'MESSAGE_ID_CONFLICT') return reply.code(409).send({ success: false, error: { code: 'MESSAGE_ID_CONFLICT', message: 'Client message ID is already in use' } })
       throw error
     }
-    io.to(`group:${request.params.id}`).emit('message.created', message)
-    return reply.code(201).send({ success: true, data: message })
+    return reply.code(created ? 201 : 200).send({ success: true, data: message })
   }
   const group = state.groups.find((item) => item.id === request.params.id)
   if (!group) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Group not found' } })
   if (!group.members?.some((member) => member.userId === request.user.id || member.id === request.user.id)) {
     return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Group access denied' } })
   }
+  if (clientMessageId) {
+    const existing = state.messages.find((item) => item.id === clientMessageId)
+    if (existing) {
+      if (existing.groupId !== request.params.id || existing.senderId !== request.user.id) {
+        return reply.code(409).send({ success: false, error: { code: 'MESSAGE_ID_CONFLICT', message: 'Client message ID is already in use' } })
+      }
+      return reply.send({ success: true, data: existing })
+    }
+  }
   const original = replyToMessageId && state.messages.find((item) => item.id === replyToMessageId && item.groupId === request.params.id)
   if (replyToMessageId && !original) return reply.code(400).send({ success: false, error: { code: 'INVALID_REPLY_REFERENCE', message: 'Reply target must be in this chat' } })
   const message = {
-    id: randomUUID(),
+    id: clientMessageId || randomUUID(),
     groupId: request.params.id,
     senderId: request.user.id,
     senderName: request.user.displayName,

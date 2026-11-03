@@ -327,7 +327,7 @@ test('rolls back group creation if owner membership cannot be created', async ()
 
 test('reads and creates messages with sender names and parameterized values', async () => {
   const row = { id: 'message-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player', sender_username: 'player', sender_avatar_url: null, text: 'Hello', emoji: null, created_at: 'created', deleted_at: null, reply_to_message_id: null }
-  const database = createFakePool([[row], undefined, row])
+  const database = createFakePool([[row], { id: 'message-id' }, row])
 
   assert.deepEqual(await getGroupMessages('group-id', database), [{
     id: 'message-id',
@@ -343,7 +343,8 @@ test('reads and creates messages with sender names and parameterized values', as
     replyTo: null,
   }])
   assert.deepEqual(database.calls[0].values, ['group-id'])
-  assert.deepEqual(await createMessage({ id: 'message-id', groupId: 'group-id', senderId: 'user-id', text: 'Hello' }, database), {
+  const created = await createMessage({ id: 'message-id', groupId: 'group-id', senderId: 'user-id', text: 'Hello' }, database)
+  assert.deepEqual(created, { created: true, message: {
     id: 'message-id',
     groupId: 'group-id',
     senderId: 'user-id',
@@ -355,7 +356,8 @@ test('reads and creates messages with sender names and parameterized values', as
     createdAt: 'created',
     deletedAt: null,
     replyTo: null,
-  })
+  } })
+  assert.match(database.calls[2].text, /ON CONFLICT \(id\) DO NOTHING/)
   assert.deepEqual(database.calls[2].values, ['message-id', 'group-id', 'user-id', 'Hello', null, null])
   assert.deepEqual(database.calls[3].values, ['message-id'])
 })
@@ -366,12 +368,13 @@ test('persists replies only to messages in the same group', async () => {
     sender_username: 'player', text: 'A reply', emoji: null, created_at: 'created',
     reply_to_message_id: 'original-id', reply_sender_name: 'Other', reply_text: 'Original',
   }
-  const database = createFakePool([{ id: 'original-id' }, undefined, row])
+  const database = createFakePool([{ id: 'original-id' }, { id: 'reply-id' }, row])
   const result = await createMessage({
     id: 'reply-id', groupId: 'group-id', senderId: 'user-id', text: 'A reply', replyToMessageId: 'original-id',
   }, database)
 
-  assert.deepEqual(result.replyTo, {
+  assert.equal(result.created, true)
+  assert.deepEqual(result.message.replyTo, {
     id: 'original-id',
     senderName: 'Other',
     text: 'Original',
@@ -385,6 +388,27 @@ test('persists replies only to messages in the same group', async () => {
     groupId: 'group-id', senderId: 'user-id', text: 'A reply', replyToMessageId: 'other-group-message',
   }, invalidDatabase), /INVALID_REPLY_REFERENCE/)
   assert.equal(invalidDatabase.calls.at(-1).text, 'ROLLBACK')
+})
+
+test('retries the same client message ID without inserting a second row', async () => {
+  const row = {
+    id: 'message-id', group_id: 'group-id', sender_id: 'user-id', sender_name: 'Player',
+    sender_username: 'player', text: 'Hello', emoji: null, created_at: 'created',
+    deleted_at: null, reply_to_message_id: null,
+  }
+  const database = createFakePool([
+    undefined,
+    { group_id: 'group-id', sender_id: 'user-id' },
+    row,
+  ])
+  const result = await createMessage({
+    id: 'message-id', groupId: 'group-id', senderId: 'user-id', text: 'Hello',
+  }, database)
+
+  assert.equal(result.created, false)
+  assert.equal(result.message.id, 'message-id')
+  assert.match(database.calls[1].text, /ON CONFLICT \(id\) DO NOTHING/)
+  assert.match(database.calls[2].text, /SELECT group_id, sender_id FROM messages WHERE id = \$1 FOR UPDATE/)
 })
 
 test('soft-deletes a message only for its original sender', async () => {
