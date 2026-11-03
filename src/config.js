@@ -6,6 +6,7 @@ const schema = z.object({
   DATABASE_URL: z.string().optional(),
   JWT_SECRET: z.string().min(16).default('development-only-change-me-please'),
   DEMO_MODE: z.enum(['true', 'false']).default('false'),
+  OWNER_EMAIL: z.string().optional(),
 })
 
 export const config = schema.parse(process.env)

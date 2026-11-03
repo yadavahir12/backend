@@ -7,6 +7,7 @@ import { Server as SocketServer } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import { config, demoMode, pool, state } from './db.js'
 import { GAME_COLORS, compareTotalWins, rankCoinBalances } from './gameRules.js'
+import { matchesOwnerEmail } from './ownerAccess.js'
 import {
   createUser,
   createPrediction as createPersistentPrediction,
@@ -76,10 +77,10 @@ async function requireAuth(request, reply) {
   if (!user) return reply.code(401).send({ success: false, error: { code: 'UNAUTHORIZED', message: 'Authentication required' } })
   request.user = user
 }
-async function requireAdmin(request, reply) {
+async function requireOwnerAdmin(request, reply) {
   await requireAuth(request, reply)
   if (reply.sent) return
-  if (!['admin', 'super_admin', 'moderator'].includes(request.user.role)) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Administrator access required' } })
+  if (!matchesOwnerEmail(request.user.email, config.OWNER_EMAIL)) return reply.code(403).send({ success: false, error: { code: 'FORBIDDEN', message: 'Owner access required' } })
 }
 function seed() {
   if (state.users.length) return
@@ -132,7 +133,10 @@ app.post('/api/auth/login', async (request, reply) => {
 })
 app.post('/api/auth/logout', async (request, reply) => { reply.clearCookie('session', { path: '/' }); return { success: true, data: null } })
 app.post('/api/auth/forgot-password', async () => ({ success: true, data: { message: 'If the account exists, reset instructions will be sent.' } }))
-app.get('/api/users/me', { preHandler: requireAuth }, async (request) => ({ success: true, data: publicUser(request.user) }))
+app.get('/api/users/me', { preHandler: requireAuth }, async (request) => ({
+  success: true,
+  data: { ...publicUser(request.user), isOwnerAdmin: matchesOwnerEmail(request.user.email, config.OWNER_EMAIL) },
+}))
 app.get('/api/users/me/profile', { preHandler: requireAuth }, async (request) => ({
   success: true,
   data: demoMode
@@ -222,7 +226,7 @@ app.get('/api/wallet/transactions', { preHandler: requireAuth }, async (request)
     : await getPersistentWalletTransactions(request.user.id),
 }))
 function adjustWallet(userId, amount, type, description, referenceId = null) { const wallet = state.wallets.find((item) => item.userId === userId); if (!wallet || wallet.balance + amount < 0) throw new Error('INSUFFICIENT_COINS'); const before = wallet.balance; wallet.balance += amount; state.transactions.push({ id: randomUUID(), userId, type, amount, balanceBefore: before, balanceAfter: wallet.balance, description, referenceId, createdAt: now() }); return wallet }
-app.post('/api/admin/wallet-adjustments', { preHandler: requireAdmin }, async (request, reply) => {
+app.post('/api/admin/wallet-adjustments', { preHandler: requireOwnerAdmin }, async (request, reply) => {
   try {
     if (demoMode) {
       const wallet = adjustWallet(request.body.userId, Number(request.body.amount), 'ADMIN_ADJUSTMENT', request.body.reason || 'Admin adjustment')
@@ -540,7 +544,7 @@ app.post('/api/notifications/read-all', { preHandler: requireAuth }, async (requ
   else await markPersistentNotificationsRead(request.user.id)
   return { success: true, data: null }
 })
-app.get('/api/admin/stats', { preHandler: requireAdmin }, async () => ({
+app.get('/api/admin/stats', { preHandler: requireOwnerAdmin }, async () => ({
   success: true,
   data: demoMode
     ? { users: state.users.length, groups: state.groups.length, messages: state.messages.length, rounds: state.rounds.length, transactions: state.transactions.length }
