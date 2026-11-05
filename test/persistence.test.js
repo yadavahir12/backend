@@ -8,6 +8,10 @@ import {
   createPrediction,
   createUser,
   followUser,
+  getAdminCoinsDashboard,
+  getAdminCoinTransactions,
+  getAdminCoinUser,
+  getAdminCoinUsers,
   getAdminStats,
   getCurrentGameRound,
   getFollowStatus,
@@ -225,6 +229,112 @@ test('reads wallet balance and mapped transaction history from Postgres', async 
   assert.deepEqual(database.calls.map(({ values }) => values), [['user-id'], ['user-id']])
 })
 
+test('reads actual admin coin totals from wallets and adjustment transactions', async () => {
+  const database = createFakePool([{
+    registered_users: 3,
+    total_coins_held: '1475',
+    total_admin_credited: '200',
+    total_admin_deducted: '35',
+    admin_adjustments: 4,
+  }])
+
+  assert.deepEqual(await getAdminCoinsDashboard(database), {
+    registeredUsers: 3,
+    totalCoinsHeld: 1475,
+    totalAdminCredited: 200,
+    totalAdminDeducted: 35,
+    adminAdjustments: 4,
+  })
+  assert.match(database.calls[0].text, /FROM coin_wallets/)
+  assert.match(database.calls[0].text, /type = 'ADMIN_ADJUSTMENT'/)
+})
+
+test('searches and paginates owner coin users without exposing private fields', async () => {
+  const database = createFakePool([
+    { total: 1 },
+    [{ id: 'user-id', username: 'player', full_name: 'Player One', balance: 245, status: 'active' }],
+  ])
+  const result = await getAdminCoinUsers({ search: 'player', limit: 10, offset: 20 }, database)
+
+  assert.deepEqual(result, {
+    items: [{ id: 'user-id', username: 'player', fullName: 'Player One', balance: 245, status: 'active' }],
+    total: 1,
+    limit: 10,
+    offset: 20,
+  })
+  assert.deepEqual(database.calls[0].values, ['%player%'])
+  assert.deepEqual(database.calls[1].values, ['%player%', 10, 20])
+  assert.match(database.calls[1].text, /LEFT JOIN coin_wallets/)
+  assert.doesNotMatch(database.calls[1].text, /email|password_hash|mobile/i)
+})
+
+test('looks up an owner coin user by exact ID or case-insensitive username', async () => {
+  const database = createFakePool([{
+    id: 'user-id',
+    username: 'player',
+    full_name: 'Player One',
+    balance: 120,
+    status: 'active',
+  }])
+
+  assert.deepEqual(await getAdminCoinUser('PLAYER', database), {
+    id: 'user-id',
+    username: 'player',
+    fullName: 'Player One',
+    balance: 120,
+    status: 'active',
+  })
+  assert.match(database.calls[0].text, /u\.id::text = \$1 OR lower\(u\.username\) = lower\(\$1\)/)
+})
+
+test('filters and paginates coin ledger history with the admin ID and balance snapshots', async () => {
+  const database = createFakePool([
+    { total: 1 },
+    [{
+      id: 'transaction-id',
+      user_id: 'user-id',
+      username: 'player',
+      transaction_type: 'DEBIT',
+      amount: 25,
+      balance_before: 100,
+      balance_after: 75,
+      admin_id: 'owner-id',
+      description: 'Support adjustment',
+      created_at: 'created',
+    }],
+  ])
+  const result = await getAdminCoinTransactions({
+    userId: 'user-id',
+    type: 'debit',
+    from: '2026-01-01',
+    to: '2026-01-02',
+    limit: 10,
+    offset: 20,
+  }, database)
+
+  assert.deepEqual(result, {
+    items: [{
+      id: 'transaction-id',
+      userId: 'user-id',
+      username: 'player',
+      type: 'DEBIT',
+      amount: 25,
+      previousBalance: 100,
+      newBalance: 75,
+      adminId: 'owner-id',
+      reason: 'Support adjustment',
+      createdAt: 'created',
+    }],
+    total: 1,
+    limit: 10,
+    offset: 20,
+  })
+  assert.deepEqual(database.calls[0].values, ['user-id', '2026-01-01', '2026-01-02'])
+  assert.deepEqual(database.calls[1].values, ['user-id', '2026-01-01', '2026-01-02', 10, 20])
+  assert.match(database.calls[1].text, /ct\.amount < 0/)
+  assert.match(database.calls[1].text, /ORDER BY ct\.created_at DESC/)
+})
+
 test('updates wallet and records its transaction atomically', async () => {
   const database = createFakePool([
     { user_id: 'user-id', balance: 100 },
@@ -262,6 +372,7 @@ test('records an audit event for owner wallet adjustments in the same transactio
     amount: 25,
     type: 'ADMIN_ADJUSTMENT',
     description: 'Support adjustment',
+    transactionId: 'transaction-id',
   })
 })
 
@@ -287,6 +398,72 @@ test('replays an existing wallet idempotency key without applying the adjustment
   assert.equal(result.duplicate, true)
   assert.equal(result.wallet.balance, 75)
   assert.equal(result.transaction.id, 'tx-id')
+  assert.equal(database.calls.some(({ text }) => text.startsWith('UPDATE coin_wallets')), false)
+})
+
+test('rechecks an idempotency key after locking the wallet to serialize concurrent adjustments', async () => {
+  const database = createFakePool([
+    undefined,
+    { user_id: 'user-id', balance: 75, created_at: 'created', updated_at: 'updated' },
+    {
+      id: 'tx-id',
+      user_id: 'user-id',
+      type: 'ADMIN_ADJUSTMENT',
+      amount: 25,
+      balance_before: 50,
+      balance_after: 75,
+      reference_type: 'admin_adjustment',
+      reference_id: 'owner-id',
+      description: 'Manual credit',
+      idempotency_key: 'same-request-key',
+    },
+    { user_id: 'user-id', balance: 75, created_at: 'created', updated_at: 'updated' },
+  ])
+  const result = await adjustWallet('user-id', {
+    amount: 25,
+    type: 'ADMIN_ADJUSTMENT',
+    description: 'Manual credit',
+    referenceType: 'admin_adjustment',
+    referenceId: 'owner-id',
+    idempotencyKey: 'same-request-key',
+    actorId: 'owner-id',
+  }, database)
+
+  assert.equal(result.duplicate, true)
+  assert.equal(result.wallet.balance, 75)
+  const lockIndex = database.calls.findIndex(({ text }) => text.includes('FOR UPDATE'))
+  const idempotencyIndexes = database.calls.reduce((indexes, { text }, index) => {
+    if (text.includes('idempotency_key = $1')) indexes.push(index)
+    return indexes
+  }, [])
+  assert.equal(idempotencyIndexes.length, 2)
+  assert.ok(lockIndex < idempotencyIndexes[1])
+  assert.equal(database.calls.some(({ text }) => text.startsWith('UPDATE coin_wallets')), false)
+})
+
+test('rejects reusing a wallet idempotency key with a different operation', async () => {
+  const database = createFakePool([{
+    id: 'tx-id',
+    user_id: 'other-user',
+    type: 'ADMIN_ADJUSTMENT',
+    amount: 25,
+    balance_before: 50,
+    balance_after: 75,
+    reference_type: 'admin_adjustment',
+    reference_id: 'owner-id',
+    description: 'Manual credit',
+    idempotency_key: 'same-request-key',
+  }])
+
+  await assert.rejects(() => adjustWallet('user-id', {
+    amount: 25,
+    type: 'ADMIN_ADJUSTMENT',
+    description: 'Manual credit',
+    referenceType: 'admin_adjustment',
+    referenceId: 'owner-id',
+    idempotencyKey: 'same-request-key',
+  }, database), /IDEMPOTENCY_CONFLICT/)
+  assert.equal(database.calls.at(-1).text, 'ROLLBACK')
   assert.equal(database.calls.some(({ text }) => text.startsWith('UPDATE coin_wallets')), false)
 })
 

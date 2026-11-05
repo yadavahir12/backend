@@ -124,7 +124,7 @@ test('owner status and admin APIs use the authenticated account email', async ()
     const adjusted = await apiRequest(backend.baseUrl, '/api/admin/wallet-adjustments', {
       token: ownerToken,
       method: 'POST',
-      body: { userId: regularUserId, amount: 100, reason: 'dashboard test' },
+      body: { userId: regularUserId, amount: 100, reason: 'dashboard test', idempotencyKey: 'legacy-adjustment-1' },
     })
     assert.equal(adjusted.status, 200)
     const initialDashboard = await apiRequest(backend.baseUrl, '/api/admin/game', { token: ownerToken })
@@ -167,6 +167,178 @@ test('owner status and admin APIs use the authenticated account email', async ()
     const page = await apiRequest(backend.baseUrl, '/api/admin/game/rounds?status=all&limit=10&offset=0', { token: ownerToken })
     assert.equal(page.status, 200)
     assert.equal(page.body.data.total, 1)
+  } finally {
+    await stopBackend(backend.child)
+  }
+})
+
+test('owner coin APIs search users and atomically credit, debit, and list transactions', async () => {
+  const backend = await startBackend('alex@example.com')
+  try {
+    const ownerLogin = await apiRequest(backend.baseUrl, '/api/auth/login', {
+      method: 'POST',
+      body: { username: 'alex@example.com', password: 'demo-password' },
+    })
+    const ownerToken = ownerLogin.body.data.token
+    const registration = await apiRequest(backend.baseUrl, '/api/auth/register', {
+      method: 'POST',
+      body: { username: 'coins-target', email: 'coins-target@example.com', password: 'coins-target-password', displayName: 'Coins Target' },
+    })
+    const targetToken = registration.body.data.token
+    const targetId = registration.body.data.user.id
+
+    const userOnlyRequests = [
+      ['/api/admin/coins/dashboard', {}],
+      ['/api/admin/coins/users', {}],
+      [`/api/admin/coins/users/${targetId}`, {}],
+      ['/api/admin/coins/transactions', {}],
+      ['/api/admin/coins/credit', { method: 'POST', body: { userId: targetId, amount: 1 } }],
+      ['/api/admin/coins/debit', { method: 'POST', body: { userId: targetId, amount: 1 } }],
+    ]
+    for (const [path, options] of userOnlyRequests) {
+      assert.equal((await apiRequest(backend.baseUrl, path, { ...options, token: targetToken })).status, 403, path)
+    }
+
+    const initialDashboard = await apiRequest(backend.baseUrl, '/api/admin/coins/dashboard', { token: ownerToken })
+    assert.equal(initialDashboard.status, 200)
+    assert.equal(initialDashboard.body.data.registeredUsers, 2)
+    assert.equal(initialDashboard.body.data.totalCoinsHeld, 1250)
+    assert.equal(initialDashboard.body.data.totalAdminCredited, 0)
+
+    const userSearch = await apiRequest(backend.baseUrl, '/api/admin/coins/users?search=coins-target&limit=10&offset=0', { token: ownerToken })
+    assert.equal(userSearch.status, 200)
+    assert.equal(userSearch.body.data.total, 1)
+    assert.deepEqual(userSearch.body.data.items[0], {
+      id: targetId,
+      username: 'coins-target',
+      fullName: 'Coins Target',
+      balance: 0,
+      status: 'active',
+    })
+    assert.equal('email' in userSearch.body.data.items[0], false)
+    const userByUsername = await apiRequest(backend.baseUrl, '/api/admin/coins/users/coins-target', { token: ownerToken })
+    assert.equal(userByUsername.body.data.id, targetId)
+
+    const creditBody = {
+      userId: targetId,
+      amount: 50,
+      reason: 'Event participation reward',
+      idempotencyKey: 'coins-credit-request-1',
+    }
+    const credit = await apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+      token: ownerToken,
+      method: 'POST',
+      body: creditBody,
+    })
+    assert.equal(credit.status, 201)
+    assert.equal(credit.body.data.wallet.balance, 50)
+    assert.equal(credit.body.data.transaction.balanceBefore, 0)
+    assert.equal(credit.body.data.transaction.balanceAfter, 50)
+    assert.equal(credit.body.data.transaction.idempotencyKey, creditBody.idempotencyKey)
+    const creditRetry = await apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+      token: ownerToken,
+      method: 'POST',
+      body: creditBody,
+    })
+    assert.equal(creditRetry.status, 200)
+    assert.equal(creditRetry.body.data.duplicate, true)
+    assert.equal(creditRetry.body.data.wallet.balance, 50)
+
+    const debitBody = {
+      userId: targetId,
+      amount: 25,
+      reason: 'Duplicate event credit correction',
+      idempotencyKey: 'coins-debit-request-1',
+    }
+    const debit = await apiRequest(backend.baseUrl, '/api/admin/coins/debit', {
+      token: ownerToken,
+      method: 'POST',
+      body: debitBody,
+    })
+    assert.equal(debit.status, 201)
+    assert.equal(debit.body.data.wallet.balance, 25)
+    const debitRetry = await apiRequest(backend.baseUrl, '/api/admin/coins/debit', {
+      token: ownerToken,
+      method: 'POST',
+      body: debitBody,
+    })
+    assert.equal(debitRetry.status, 200)
+    assert.equal(debitRetry.body.data.wallet.balance, 25)
+
+    const concurrentCreditBody = {
+      userId: targetId,
+      amount: 10,
+      reason: 'Concurrent retry protection',
+      idempotencyKey: 'coins-concurrent-credit-1',
+    }
+    const concurrentCredits = await Promise.all([
+      apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+        token: ownerToken,
+        method: 'POST',
+        body: concurrentCreditBody,
+      }),
+      apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+        token: ownerToken,
+        method: 'POST',
+        body: concurrentCreditBody,
+      }),
+    ])
+    assert.deepEqual(concurrentCredits.map((result) => result.status).sort(), [200, 201])
+    assert.equal(concurrentCredits[0].body.data.wallet.balance, 35)
+    assert.equal(concurrentCredits[1].body.data.wallet.balance, 35)
+
+    const insufficient = await apiRequest(backend.baseUrl, '/api/admin/coins/debit', {
+      token: ownerToken,
+      method: 'POST',
+      body: { userId: targetId, amount: 1000, reason: 'Invalid deduction test', idempotencyKey: 'coins-insufficient-1' },
+    })
+    assert.equal(insufficient.status, 409)
+    const invalidAmount = await apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+      token: ownerToken,
+      method: 'POST',
+      body: { userId: targetId, amount: 1.5, reason: 'Invalid fractional amount', idempotencyKey: 'coins-invalid-amount-1' },
+    })
+    assert.equal(invalidAmount.status, 400)
+    const missingReason = await apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+      token: ownerToken,
+      method: 'POST',
+      body: { userId: targetId, amount: 1, idempotencyKey: 'coins-missing-reason-1' },
+    })
+    assert.equal(missingReason.status, 400)
+    const reusedKey = await apiRequest(backend.baseUrl, '/api/admin/coins/credit', {
+      token: ownerToken,
+      method: 'POST',
+      body: { ...creditBody, amount: 51 },
+    })
+    assert.equal(reusedKey.status, 409)
+
+    const history = await apiRequest(backend.baseUrl, `/api/admin/coins/transactions?userId=${targetId}&type=debit&limit=10&offset=0`, { token: ownerToken })
+    assert.equal(history.status, 200)
+    assert.equal(history.body.data.total, 1)
+    assert.deepEqual({
+      type: history.body.data.items[0].type,
+      amount: history.body.data.items[0].amount,
+      previousBalance: history.body.data.items[0].previousBalance,
+      newBalance: history.body.data.items[0].newBalance,
+      adminId: history.body.data.items[0].adminId,
+      reason: history.body.data.items[0].reason,
+    }, {
+      type: 'DEBIT',
+      amount: 25,
+      previousBalance: 50,
+      newBalance: 25,
+      adminId: 'demo-user-alex',
+      reason: debitBody.reason,
+    })
+
+    const finalDashboard = await apiRequest(backend.baseUrl, '/api/admin/coins/dashboard', { token: ownerToken })
+    assert.deepEqual(finalDashboard.body.data, {
+      registeredUsers: 2,
+      totalCoinsHeld: 1285,
+      totalAdminCredited: 60,
+      totalAdminDeducted: 25,
+      adminAdjustments: 3,
+    })
   } finally {
     await stopBackend(backend.child)
   }

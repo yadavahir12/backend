@@ -312,25 +312,167 @@ export async function getWalletTransactions(userId, database = pool) {
   return result.rows.map(mapCoinTransaction)
 }
 
+function mapAdminCoinUser(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    username: row.username,
+    fullName: row.full_name || row.username,
+    balance: Number(row.balance || 0),
+    status: row.status,
+  }
+}
+
+export async function getAdminCoinsDashboard(database = pool) {
+  const result = await database.query(
+    `SELECT
+       (SELECT count(*)::int FROM users) AS registered_users,
+       (SELECT COALESCE(sum(balance), 0)::numeric::text FROM coin_wallets) AS total_coins_held,
+       (SELECT COALESCE(sum(amount), 0)::numeric::text
+        FROM coin_transactions WHERE type = 'ADMIN_ADJUSTMENT' AND amount > 0) AS total_admin_credited,
+       (SELECT COALESCE(sum(abs(amount)), 0)::numeric::text
+        FROM coin_transactions WHERE type = 'ADMIN_ADJUSTMENT' AND amount < 0) AS total_admin_deducted,
+       (SELECT count(*)::int FROM coin_transactions WHERE type = 'ADMIN_ADJUSTMENT') AS admin_adjustments`,
+  )
+  const row = result.rows[0]
+  return {
+    registeredUsers: Number(row.registered_users),
+    totalCoinsHeld: Number(row.total_coins_held),
+    totalAdminCredited: Number(row.total_admin_credited),
+    totalAdminDeducted: Number(row.total_admin_deducted),
+    adminAdjustments: Number(row.admin_adjustments),
+  }
+}
+
+export async function getAdminCoinUsers({ search = '', limit = 20, offset = 0 }, database = pool) {
+  const pattern = search.trim() ? `%${search.trim()}%` : null
+  const filter = `($1::text IS NULL OR u.id::text ILIKE $1 OR u.username ILIKE $1)`
+  const count = await database.query(
+    `SELECT count(*)::int AS total
+     FROM users u
+     WHERE ${filter}`,
+    [pattern],
+  )
+  const result = await database.query(
+    `SELECT u.id, u.username, u.status,
+            COALESCE(p.display_name, u.username) AS full_name,
+            COALESCE(w.balance, 0)::int AS balance
+     FROM users u
+     LEFT JOIN profiles p ON p.user_id = u.id
+     LEFT JOIN coin_wallets w ON w.user_id = u.id
+     WHERE ${filter}
+     ORDER BY u.created_at DESC, u.id
+     LIMIT $2 OFFSET $3`,
+    [pattern, limit, offset],
+  )
+  return { items: result.rows.map(mapAdminCoinUser), total: Number(count.rows[0].total), limit, offset }
+}
+
+export async function getAdminCoinUser(identifier, database = pool) {
+  const result = await database.query(
+    `SELECT u.id, u.username, u.status,
+            COALESCE(p.display_name, u.username) AS full_name,
+            COALESCE(w.balance, 0)::int AS balance
+     FROM users u
+     LEFT JOIN profiles p ON p.user_id = u.id
+     LEFT JOIN coin_wallets w ON w.user_id = u.id
+     WHERE u.id::text = $1 OR lower(u.username) = lower($1)
+     LIMIT 1`,
+    [identifier],
+  )
+  return mapAdminCoinUser(result.rows[0])
+}
+
+export async function getAdminCoinTransactions({ userId = '', type = 'all', from = null, to = null, limit = 20, offset = 0 }, database = pool) {
+  const values = []
+  const conditions = []
+  if (userId) {
+    values.push(userId)
+    conditions.push(`ct.user_id::text = $${values.length}`)
+  }
+  if (type === 'credit') conditions.push('ct.amount > 0')
+  if (type === 'debit') conditions.push('ct.amount < 0')
+  if (from) {
+    values.push(from)
+    conditions.push(`ct.created_at >= $${values.length}`)
+  }
+  if (to) {
+    values.push(to)
+    conditions.push(`ct.created_at < $${values.length}`)
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+  const count = await database.query(
+    `SELECT count(*)::int AS total
+     FROM coin_transactions ct
+     ${where}`,
+    values,
+  )
+  const pageValues = [...values, limit, offset]
+  const result = await database.query(
+    `SELECT ct.id, ct.user_id, u.username,
+            CASE WHEN ct.amount > 0 THEN 'CREDIT' ELSE 'DEBIT' END AS transaction_type,
+            abs(ct.amount::bigint)::text AS amount, ct.balance_before, ct.balance_after,
+            CASE WHEN ct.type = 'ADMIN_ADJUSTMENT' AND ct.reference_type = 'admin_adjustment'
+              THEN ct.reference_id ELSE NULL END AS admin_id,
+            ct.description, ct.created_at
+     FROM coin_transactions ct
+     JOIN users u ON u.id = ct.user_id
+     WHERE ${conditions.length ? conditions.join(' AND ') : 'TRUE'}
+     ORDER BY ct.created_at DESC, ct.id DESC
+     LIMIT $${pageValues.length - 1} OFFSET $${pageValues.length}`,
+    pageValues,
+  )
+  return {
+    items: result.rows.map((row) => ({
+      id: row.id,
+      userId: row.user_id,
+      username: row.username,
+      type: row.transaction_type,
+      amount: Number(row.amount),
+      previousBalance: Number(row.balance_before),
+      newBalance: Number(row.balance_after),
+      adminId: row.admin_id,
+      reason: row.description || '',
+      createdAt: row.created_at,
+    })),
+    total: Number(count.rows[0].total),
+    limit,
+    offset,
+  }
+}
+
 export async function adjustWallet(userId, { amount, type, description, referenceType = null, referenceId = null, idempotencyKey = null, actorId = null }, database = pool) {
-  if (!Number.isSafeInteger(amount) || amount === 0) throw new Error('INVALID_COIN_ADJUSTMENT')
+  if (!Number.isSafeInteger(amount) || amount === 0 || Math.abs(amount) > 2_147_483_647) throw new Error('INVALID_COIN_ADJUSTMENT')
   return withTransaction(async (client) => {
-    if (idempotencyKey) {
-      const existing = await client.query(
+    const replayIfPresent = async (lockWallet = false) => {
+      if (!idempotencyKey) return null
+      const existingResult = await client.query(
         `SELECT id, user_id, type, amount, balance_before, balance_after,
                 reference_type, reference_id, description, idempotency_key, created_at
          FROM coin_transactions WHERE idempotency_key = $1`,
         [idempotencyKey],
       )
-      if (existing.rows[0]) {
-        const wallet = await client.query(
-          `SELECT user_id, balance, created_at, updated_at
-           FROM coin_wallets WHERE user_id = $1`,
-          [userId],
-        )
-        return { wallet: mapWallet(wallet.rows[0]), transaction: mapCoinTransaction(existing.rows[0]), duplicate: true }
+      const existing = existingResult.rows[0]
+      if (!existing) return null
+      if (existing.user_id !== userId
+        || existing.type !== type
+        || Number(existing.amount) !== amount
+        || (existing.description || '') !== (description || '')
+        || (existing.reference_type ?? null) !== referenceType
+        || (existing.reference_id ?? null) !== (referenceId == null ? null : String(referenceId))) {
+        throw new Error('IDEMPOTENCY_CONFLICT')
       }
+      const wallet = await client.query(
+        `SELECT user_id, balance, created_at, updated_at
+         FROM coin_wallets WHERE user_id = $1${lockWallet ? ' FOR UPDATE' : ''}`,
+        [userId],
+      )
+      if (!wallet.rows[0]) throw new Error('WALLET_NOT_FOUND')
+      return { wallet: mapWallet(wallet.rows[0]), transaction: mapCoinTransaction(existing), duplicate: true }
     }
+
+    const previousAttempt = await replayIfPresent()
+    if (previousAttempt) return previousAttempt
 
     const locked = await client.query(
       `SELECT user_id, balance, created_at, updated_at
@@ -339,7 +481,10 @@ export async function adjustWallet(userId, { amount, type, description, referenc
     )
     const currentWallet = locked.rows[0]
     if (!currentWallet) throw new Error('WALLET_NOT_FOUND')
+    const concurrentAttempt = await replayIfPresent(true)
+    if (concurrentAttempt) return concurrentAttempt
     if (currentWallet.balance + amount < 0) throw new Error('INSUFFICIENT_COINS')
+    if (currentWallet.balance + amount > 2_147_483_647) throw new Error('BALANCE_LIMIT_EXCEEDED')
 
     const updated = await client.query(
       `UPDATE coin_wallets
@@ -371,7 +516,12 @@ export async function adjustWallet(userId, { amount, type, description, referenc
       await client.query(
         `INSERT INTO audit_events (id, actor_id, action, entity_type, entity_id, metadata)
          VALUES ($1, $2, 'admin.wallet.adjusted', 'user_wallet', $3, $4::jsonb)`,
-        [randomUUID(), actorId, userId, JSON.stringify({ amount, type, description: description || '' })],
+        [randomUUID(), actorId, userId, JSON.stringify({
+          amount,
+          type,
+          description: description || '',
+          transactionId: transaction.rows[0].id,
+        })],
       )
     }
     return { wallet: mapWallet(updated.rows[0]), transaction: mapCoinTransaction(transaction.rows[0]), duplicate: false }

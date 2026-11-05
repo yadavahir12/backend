@@ -15,6 +15,10 @@ import {
   createMessage as createPersistentMessage,
   deleteMessage as deletePersistentMessage,
   followUser as followPersistentUser,
+  getAdminCoinsDashboard as getPersistentAdminCoinsDashboard,
+  getAdminCoinTransactions as getPersistentAdminCoinTransactions,
+  getAdminCoinUser as getPersistentAdminCoinUser,
+  getAdminCoinUsers as getPersistentAdminCoinUsers,
   getAdminStats as getPersistentAdminStats,
   getCurrentGameRound,
   getGameRoundHistory,
@@ -341,24 +345,231 @@ app.get('/api/wallet/transactions', { preHandler: requireAuth }, async (request)
     : await getPersistentWalletTransactions(request.user.id),
 }))
 function adjustWallet(userId, amount, type, description, referenceId = null) { const wallet = state.wallets.find((item) => item.userId === userId); if (!wallet || wallet.balance + amount < 0) throw new Error('INSUFFICIENT_COINS'); const before = wallet.balance; wallet.balance += amount; state.transactions.push({ id: randomUUID(), userId, type, amount, balanceBefore: before, balanceAfter: wallet.balance, description, referenceId, createdAt: now() }); return wallet }
-app.post('/api/admin/wallet-adjustments', { preHandler: requireOwnerAdmin }, async (request, reply) => {
-  try {
-    if (demoMode) {
-      const wallet = adjustWallet(request.body.userId, Number(request.body.amount), 'ADMIN_ADJUSTMENT', request.body.reason || 'Admin adjustment')
-      state.auditEvents.push({ id: randomUUID(), actorId: request.user.id, action: 'admin.wallet.adjusted', entityType: 'user_wallet', entityId: request.body.userId, metadata: { amount: Number(request.body.amount), reason: request.body.reason || 'Admin adjustment' }, createdAt: now() })
-      return { success: true, data: wallet }
-    }
-    const result = await adjustPersistentWallet(request.body.userId, {
-      amount: Number(request.body.amount),
-      type: 'ADMIN_ADJUSTMENT',
-      description: request.body.reason || 'Admin adjustment',
-      actorId: request.user.id,
-    })
-    return { success: true, data: result.wallet }
-  } catch (error) {
-    const code = error.message === 'INSUFFICIENT_COINS' ? error.message : error.message === 'WALLET_NOT_FOUND' ? error.message : 'INVALID_COIN_ADJUSTMENT'
-    return reply.code(400).send({ success: false, error: { code, message: 'Wallet adjustment failed' } })
+
+const maxCoinBalance = 2_147_483_647
+function getDemoCoinUser(user) {
+  const profile = state.profiles.find((item) => item.userId === user.id)
+  const wallet = state.wallets.find((item) => item.userId === user.id)
+  return {
+    id: user.id,
+    username: user.username,
+    fullName: profile?.displayName || user.displayName || user.username,
+    balance: wallet?.balance || 0,
+    status: user.status,
   }
+}
+function getDemoAdminCoinDashboard() {
+  const adjustments = state.transactions.filter((item) => item.type === 'ADMIN_ADJUSTMENT')
+  return {
+    registeredUsers: state.users.length,
+    totalCoinsHeld: state.wallets.reduce((sum, wallet) => sum + wallet.balance, 0),
+    totalAdminCredited: adjustments.reduce((sum, item) => sum + Math.max(item.amount, 0), 0),
+    totalAdminDeducted: adjustments.reduce((sum, item) => sum + Math.max(-item.amount, 0), 0),
+    adminAdjustments: adjustments.length,
+  }
+}
+function getDemoAdminCoinUsers({ search, limit, offset }) {
+  const query = search.trim().toLowerCase()
+  const filtered = state.users
+    .filter((user) => !query || user.id.toLowerCase().includes(query) || user.username.toLowerCase().includes(query))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id))
+  return { items: filtered.slice(offset, offset + limit).map(getDemoCoinUser), total: filtered.length, limit, offset }
+}
+function getDemoAdminCoinUser(identifier) {
+  const normalized = identifier.toLowerCase()
+  const user = state.users.find((item) => item.id.toLowerCase() === normalized || item.username.toLowerCase() === normalized)
+  return user ? getDemoCoinUser(user) : null
+}
+function getDemoAdminCoinTransactions({ userId, type, from, to, limit, offset }) {
+  const filtered = state.transactions
+    .filter((item) => !userId || item.userId === userId)
+    .filter((item) => type === 'all' || (type === 'credit' ? item.amount > 0 : item.amount < 0))
+    .filter((item) => !from || new Date(item.createdAt) >= new Date(from))
+    .filter((item) => !to || new Date(item.createdAt) < new Date(to))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
+  return {
+    items: filtered.slice(offset, offset + limit).map((item) => ({
+      id: item.id,
+      userId: item.userId,
+      username: state.users.find((user) => user.id === item.userId)?.username || '',
+      type: item.amount > 0 ? 'CREDIT' : 'DEBIT',
+      amount: Math.abs(item.amount),
+      previousBalance: item.balanceBefore,
+      newBalance: item.balanceAfter,
+      adminId: item.type === 'ADMIN_ADJUSTMENT' ? item.referenceId || null : null,
+      reason: item.description || '',
+      createdAt: item.createdAt,
+    })),
+    total: filtered.length,
+    limit,
+    offset,
+  }
+}
+function validateCoinListQuery(query, reply) {
+  const limit = Number(query.limit ?? 20)
+  const offset = Number(query.offset ?? 0)
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100
+    || !Number.isInteger(offset) || offset < 0
+    || (query.search && String(query.search).length > 120)
+    || (query.userId && String(query.userId).length > 120)
+    || (query.type && !['all', 'credit', 'debit'].includes(query.type))
+    || (query.from && !Number.isFinite(Date.parse(query.from)))
+    || (query.to && !Number.isFinite(Date.parse(query.to)))) {
+    reply.code(400).send({ success: false, error: { code: 'INVALID_FILTER', message: 'Coins filters are invalid' } })
+    return null
+  }
+  return { limit, offset }
+}
+function validateAdminAdjustment(body, { signed = false } = {}) {
+  const userId = String(body?.userId || '').trim()
+  const amount = Number(body?.amount)
+  const reason = String(body?.reason || '').trim()
+  const idempotencyKey = String(body?.idempotencyKey || '').trim()
+  if (!userId || userId.length > 120) throw new Error('INVALID_COIN_ADJUSTMENT')
+  if (!Number.isSafeInteger(amount) || amount === 0 || Math.abs(amount) > maxCoinBalance || (!signed && amount < 1)) {
+    throw new Error('INVALID_COIN_ADJUSTMENT')
+  }
+  if (reason.length < 3 || reason.length > 300) throw new Error('INVALID_ADJUSTMENT_REASON')
+  if (idempotencyKey.length < 8 || idempotencyKey.length > 128) throw new Error('INVALID_IDEMPOTENCY_KEY')
+  return { userId, amount, reason, idempotencyKey }
+}
+function applyDemoAdminCoinAdjustment(userId, amount, reason, idempotencyKey, actorId) {
+  const referenceType = 'admin_adjustment'
+  const referenceId = actorId
+  const existing = state.transactions.find((item) => item.idempotencyKey === idempotencyKey)
+  if (existing) {
+    if (existing.userId !== userId
+      || existing.type !== 'ADMIN_ADJUSTMENT'
+      || existing.amount !== amount
+      || existing.description !== reason
+      || existing.referenceType !== referenceType
+      || existing.referenceId !== referenceId) {
+      throw new Error('IDEMPOTENCY_CONFLICT')
+    }
+    const wallet = state.wallets.find((item) => item.userId === userId)
+    if (!wallet) throw new Error('WALLET_NOT_FOUND')
+    return { wallet, transaction: existing, duplicate: true }
+  }
+  const wallet = state.wallets.find((item) => item.userId === userId)
+  if (!wallet) throw new Error('WALLET_NOT_FOUND')
+  if (wallet.balance + amount < 0) throw new Error('INSUFFICIENT_COINS')
+  if (wallet.balance + amount > maxCoinBalance) throw new Error('BALANCE_LIMIT_EXCEEDED')
+  const balanceBefore = wallet.balance
+  wallet.balance += amount
+  const transaction = {
+    id: randomUUID(),
+    userId,
+    type: 'ADMIN_ADJUSTMENT',
+    amount,
+    balanceBefore,
+    balanceAfter: wallet.balance,
+    referenceType,
+    referenceId,
+    description: reason,
+    idempotencyKey,
+    createdAt: now(),
+  }
+  state.transactions.push(transaction)
+  state.auditEvents.push({
+    id: randomUUID(),
+    actorId,
+    action: 'admin.wallet.adjusted',
+    entityType: 'user_wallet',
+    entityId: userId,
+    metadata: { amount, type: 'ADMIN_ADJUSTMENT', reason, transactionId: transaction.id },
+    createdAt: now(),
+  })
+  return { wallet, transaction, duplicate: false }
+}
+async function applyAdminCoinAdjustment(request, reply, amount, { legacy = false, direction = 'credit' } = {}) {
+  let input
+  try {
+    input = validateAdminAdjustment({ ...request.body, amount }, { signed: legacy })
+  } catch (error) {
+    const messages = {
+      INVALID_COIN_ADJUSTMENT: 'User and a valid positive integer coin amount are required',
+      INVALID_ADJUSTMENT_REASON: 'A reason of 3-300 characters is required',
+      INVALID_IDEMPOTENCY_KEY: 'A valid idempotency key is required',
+    }
+    return reply.code(400).send({ success: false, error: { code: error.message, message: messages[error.message] || 'Wallet adjustment is invalid' } })
+  }
+  try {
+    const signedAmount = legacy ? input.amount : direction === 'debit' ? -input.amount : input.amount
+    const result = demoMode
+      ? applyDemoAdminCoinAdjustment(input.userId, signedAmount, input.reason, input.idempotencyKey, request.user.id)
+      : await adjustPersistentWallet(input.userId, {
+        amount: signedAmount,
+        type: 'ADMIN_ADJUSTMENT',
+        description: input.reason,
+        referenceType: 'admin_adjustment',
+        referenceId: request.user.id,
+        idempotencyKey: input.idempotencyKey,
+        actorId: request.user.id,
+      })
+    if (legacy) return reply.send({ success: true, data: result.wallet })
+    return reply.code(result.duplicate ? 200 : 201).send({
+      success: true,
+      data: { wallet: result.wallet, transaction: result.transaction, duplicate: result.duplicate },
+    })
+  } catch (error) {
+    const errors = {
+      WALLET_NOT_FOUND: [404, 'User wallet not found'],
+      INSUFFICIENT_COINS: [409, 'The wallet does not have enough coins'],
+      BALANCE_LIMIT_EXCEEDED: [409, 'The resulting wallet balance exceeds the supported limit'],
+      IDEMPOTENCY_CONFLICT: [409, 'This idempotency key was already used for a different adjustment'],
+    }
+    const knownError = errors[error.message]
+      || (error.code === '23505' && error.constraint?.includes('idempotency') ? [409, 'This idempotency key was already used'] : null)
+    if (!knownError) throw error
+    return reply.code(knownError[0]).send({ success: false, error: { code: error.message, message: knownError[1] } })
+  }
+}
+
+app.get('/api/admin/coins/dashboard', { preHandler: requireOwnerAdmin }, async () => ({
+  success: true,
+  data: demoMode ? getDemoAdminCoinDashboard() : await getPersistentAdminCoinsDashboard(),
+}))
+app.get('/api/admin/coins/users', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const pagination = validateCoinListQuery(request.query, reply)
+  if (!pagination) return
+  const options = { ...pagination, search: String(request.query.search || '') }
+  return {
+    success: true,
+    data: demoMode ? getDemoAdminCoinUsers(options) : await getPersistentAdminCoinUsers(options),
+  }
+})
+app.get('/api/admin/coins/users/:identifier', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const identifier = String(request.params.identifier || '').trim()
+  if (!identifier || identifier.length > 120) return reply.code(400).send({ success: false, error: { code: 'INVALID_USER', message: 'A valid user ID or username is required' } })
+  const user = demoMode ? getDemoAdminCoinUser(identifier) : await getPersistentAdminCoinUser(identifier)
+  if (!user) return reply.code(404).send({ success: false, error: { code: 'USER_NOT_FOUND', message: 'User not found' } })
+  return { success: true, data: user }
+})
+app.get('/api/admin/coins/transactions', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const pagination = validateCoinListQuery(request.query, reply)
+  if (!pagination) return
+  const options = {
+    ...pagination,
+    userId: String(request.query.userId || ''),
+    type: request.query.type || 'all',
+    from: request.query.from || null,
+    to: request.query.to || null,
+  }
+  return {
+    success: true,
+    data: demoMode ? getDemoAdminCoinTransactions(options) : await getPersistentAdminCoinTransactions(options),
+  }
+})
+app.post('/api/admin/coins/credit', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const amount = Number(request.body?.amount)
+  return applyAdminCoinAdjustment(request, reply, amount)
+})
+app.post('/api/admin/coins/debit', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const amount = Number(request.body?.amount)
+  return applyAdminCoinAdjustment(request, reply, amount, { direction: 'debit' })
+})
+app.post('/api/admin/wallet-adjustments', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  return applyAdminCoinAdjustment(request, reply, Number(request.body?.amount), { legacy: true })
 })
 app.get('/api/groups', { preHandler: requireAuth }, async () => ({
   success: true,
