@@ -11,7 +11,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_id_group_idx ON messages(id, group_id
 CREATE TABLE IF NOT EXISTS follows (follower_id UUID REFERENCES users(id) ON DELETE CASCADE, following_id UUID REFERENCES users(id) ON DELETE CASCADE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (follower_id, following_id), CHECK (follower_id <> following_id));
 CREATE TABLE IF NOT EXISTS achievements (id UUID PRIMARY KEY, name TEXT UNIQUE NOT NULL, description TEXT NOT NULL, criteria JSONB NOT NULL DEFAULT '{}'::jsonb, is_active BOOLEAN NOT NULL DEFAULT true);
 CREATE TABLE IF NOT EXISTS user_achievements (user_id UUID REFERENCES users(id) ON DELETE CASCADE, achievement_id UUID REFERENCES achievements(id) ON DELETE CASCADE, unlocked_at TIMESTAMPTZ NOT NULL DEFAULT now(), progress INTEGER NOT NULL DEFAULT 100, PRIMARY KEY (user_id, achievement_id));
-CREATE TABLE IF NOT EXISTS game_rounds (id UUID PRIMARY KEY, round_number BIGINT UNIQUE NOT NULL, status TEXT NOT NULL, start_time TIMESTAMPTZ NOT NULL, end_time TIMESTAMPTZ NOT NULL, result TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS game_rounds (id UUID PRIMARY KEY, round_number BIGINT UNIQUE NOT NULL, status TEXT NOT NULL, start_time TIMESTAMPTZ NOT NULL, end_time TIMESTAMPTZ NOT NULL, result TEXT, result_generated_at TIMESTAMPTZ, paused_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE OR REPLACE FUNCTION prevent_finalized_game_result_update() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.result IS NOT NULL AND (
+    NEW.result IS DISTINCT FROM OLD.result
+    OR NEW.result_generated_at IS DISTINCT FROM OLD.result_generated_at
+  ) THEN
+    RAISE EXCEPTION 'FINALIZED_GAME_RESULT_IMMUTABLE';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS game_round_result_immutable ON game_rounds;
+CREATE TRIGGER game_round_result_immutable
+  BEFORE UPDATE ON game_rounds
+  FOR EACH ROW EXECUTE FUNCTION prevent_finalized_game_result_update();
 CREATE TABLE IF NOT EXISTS game_predictions (id UUID PRIMARY KEY, user_id UUID REFERENCES users(id), round_id UUID REFERENCES game_rounds(id), selected_color TEXT NOT NULL, virtual_coin_amount INTEGER NOT NULL CHECK (virtual_coin_amount > 0), status TEXT NOT NULL DEFAULT 'pending', reward INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (user_id, round_id));
 CREATE TABLE IF NOT EXISTS leaderboard_seasons (id UUID PRIMARY KEY, name TEXT NOT NULL, starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL, status TEXT NOT NULL DEFAULT 'active');
 CREATE TABLE IF NOT EXISTS notifications (id UUID PRIMARY KEY, user_id UUID REFERENCES users(id) ON DELETE CASCADE, type TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, read_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now());

@@ -1,11 +1,17 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { GAME_COLORS, LEADERBOARD_METRIC, compareCoinBalances, compareTotalWins, isValidColor, rankCoinBalances } from '../src/gameRules.js'
+import { GAME_COLORS, LEADERBOARD_METRIC, compareCoinBalances, compareTotalWins, generateFairGameResult, isValidColor, rankCoinBalances } from '../src/gameRules.js'
 
 test('uses the confirmed virtual game colors', () => {
   assert.deepEqual(GAME_COLORS, ['Red', 'Green', 'Violet'])
   assert.equal(isValidColor('Red'), true)
   assert.equal(isValidColor('Mint'), false)
+})
+
+test('generates results from the configured colors without player-selection input', () => {
+  assert.equal(generateFairGameResult.length, 0)
+  for (let index = 0; index < 100; index += 1) assert.ok(GAME_COLORS.includes(generateFairGameResult()))
+  assert.throws(() => generateFairGameResult([]), /At least one game result/)
 })
 
 test('ranks users by total wins descending', () => {

@@ -6,7 +6,7 @@ import jwt from 'jsonwebtoken'
 import { Server as SocketServer } from 'socket.io'
 import { randomUUID } from 'node:crypto'
 import { config, demoMode, pool, state } from './db.js'
-import { GAME_COLORS, compareTotalWins, rankCoinBalances } from './gameRules.js'
+import { GAME_COLORS, compareTotalWins, generateFairGameResult, rankCoinBalances } from './gameRules.js'
 import { matchesOwnerEmail } from './ownerAccess.js'
 import {
   createUser,
@@ -17,6 +17,11 @@ import {
   followUser as followPersistentUser,
   getAdminStats as getPersistentAdminStats,
   getCurrentGameRound,
+  getGameRoundHistory,
+  getRoundColorStats,
+  pauseGameRound as pausePersistentGameRound,
+  resumeGameRound as resumePersistentGameRound,
+  settleExpiredGameRound,
   getGameResult as getPersistentGameResult,
   getGameRound,
   getFollowStatus as getPersistentFollowStatus,
@@ -93,6 +98,115 @@ function seed() {
   state.groups.push({ id: 'demo-color-chasers', name: 'Color Chasers', icon: null, ownerId: id, visibility: 'public', memberCount: 128, createdAt: now() })
 }
 if (demoMode) seed()
+
+function settleDemoRound(round) {
+  if (!round || round.status !== 'active' || round.result || new Date(round.endTime) > new Date()) return null
+  const result = generateFairGameResult(GAME_COLORS)
+  round.status = 'completed'
+  round.result = result
+  round.resultGeneratedAt = now()
+  for (const prediction of state.predictions) {
+    if (prediction.roundId === round.id && prediction.status === 'pending') {
+      prediction.status = prediction.selectedColor === result ? 'won' : 'lost'
+    }
+  }
+  state.auditEvents.push({
+    id: randomUUID(),
+    actorId: null,
+    action: 'game.round.result_generated',
+    entityType: 'game_round',
+    entityId: round.id,
+    metadata: { result, algorithm: 'node:crypto.randomInt', colorCount: GAME_COLORS.length },
+    createdAt: now(),
+  })
+  return round
+}
+
+function getDemoCurrentRound() {
+  const previous = state.rounds.at(-1)
+  settleDemoRound(previous)
+  let round = state.rounds.slice().reverse().find((item) => item.status === 'active' || item.status === 'paused')
+  if (round) return round
+  const start = Date.now()
+  round = {
+    id: randomUUID(),
+    roundNumber: (previous?.roundNumber || 2048) + 1,
+    status: 'active',
+    startTime: new Date(start).toISOString(),
+    endTime: new Date(start + 42000).toISOString(),
+    colors: GAME_COLORS,
+    result: null,
+    resultGeneratedAt: null,
+    pausedAt: null,
+  }
+  state.rounds.push(round)
+  return round
+}
+
+function getDemoRoundStatistics(round) {
+  if (!round) return null
+  const predictions = state.predictions.filter((item) => item.roundId === round.id)
+  const totalSelections = predictions.length
+  const colors = Object.fromEntries(GAME_COLORS.map((color) => {
+    const matches = predictions.filter((item) => item.selectedColor === color)
+    return [color, {
+      players: new Set(matches.map((item) => item.userId)).size,
+      selections: matches.length,
+      percentage: totalSelections ? Number((matches.length * 100 / totalSelections).toFixed(1)) : 0,
+    }]
+  }))
+  return {
+    roundId: round.id,
+    roundNumber: round.roundNumber,
+    status: round.status,
+    startTime: round.startTime,
+    endTime: round.endTime,
+    result: round.result || null,
+    resultGeneratedAt: round.resultGeneratedAt || null,
+    pausedAt: round.pausedAt || null,
+    totalSelections,
+    activePlayers: new Set(predictions.map((item) => item.userId)).size,
+    colors,
+  }
+}
+
+function getDemoRoundHistory({ limit, offset, status, from, to }) {
+  const filtered = state.rounds
+    .filter((round) => !status || round.status === status)
+    .filter((round) => !from || new Date(round.startTime) >= new Date(from))
+    .filter((round) => !to || new Date(round.startTime) < new Date(to))
+    .sort((left, right) => right.roundNumber - left.roundNumber)
+  return {
+    items: filtered.slice(offset, offset + limit).map((round) => ({
+      id: round.id,
+      roundNumber: round.roundNumber,
+      status: round.status,
+      startTime: round.startTime,
+      endTime: round.endTime,
+      result: round.result || null,
+      resultGeneratedAt: round.resultGeneratedAt || null,
+      totalPlayers: new Set(state.predictions.filter((item) => item.roundId === round.id).map((item) => item.userId)).size,
+    })),
+    total: filtered.length,
+  }
+}
+
+async function getOwnerDashboardSnapshot() {
+  const round = demoMode ? getDemoCurrentRound() : await getCurrentGameRound(GAME_COLORS)
+  const statistics = demoMode
+    ? getDemoRoundStatistics(round)
+    : await getRoundColorStats(round.id)
+  return { currentRound: round, statistics }
+}
+
+async function publishOwnerDashboardUpdate() {
+  try {
+    const snapshot = await getOwnerDashboardSnapshot()
+    io.to('admin:game').emit('admin.game.updated', snapshot)
+  } catch (error) {
+    app.log.error(error, 'Unable to publish game dashboard update')
+  }
+}
 
 app.get('/health', async () => ({ success: true, data: { status: 'ok', database: demoMode ? 'demo-memory' : 'postgres-configured', timestamp: now() } }))
 app.post('/api/auth/register', async (request, reply) => {
@@ -231,12 +345,14 @@ app.post('/api/admin/wallet-adjustments', { preHandler: requireOwnerAdmin }, asy
   try {
     if (demoMode) {
       const wallet = adjustWallet(request.body.userId, Number(request.body.amount), 'ADMIN_ADJUSTMENT', request.body.reason || 'Admin adjustment')
+      state.auditEvents.push({ id: randomUUID(), actorId: request.user.id, action: 'admin.wallet.adjusted', entityType: 'user_wallet', entityId: request.body.userId, metadata: { amount: Number(request.body.amount), reason: request.body.reason || 'Admin adjustment' }, createdAt: now() })
       return { success: true, data: wallet }
     }
     const result = await adjustPersistentWallet(request.body.userId, {
       amount: Number(request.body.amount),
       type: 'ADMIN_ADJUSTMENT',
       description: request.body.reason || 'Admin adjustment',
+      actorId: request.user.id,
     })
     return { success: true, data: result.wallet }
   } catch (error) {
@@ -437,14 +553,11 @@ app.delete('/api/groups/:id/messages/:messageId', { preHandler: requireAuth }, a
   return { success: true, data: message }
 })
 app.get('/api/game/rounds/current', async () => {
-  if (!demoMode) return { success: true, data: await getCurrentGameRound(GAME_COLORS) }
-  let round = state.rounds.at(-1)
-  if (!round || new Date(round.endTime) <= new Date()) {
-    const start = Date.now()
-    round = { id: randomUUID(), roundNumber: (round?.roundNumber || 2048) + 1, status: 'active', startTime: new Date(start).toISOString(), endTime: new Date(start + 42000).toISOString(), colors: GAME_COLORS, result: null }
-    state.rounds.push(round)
-  }
-  return { success: true, data: round }
+  const finalized = demoMode
+    ? settleDemoRound(state.rounds.slice().reverse().find((item) => item.status === 'active'))
+    : await settleExpiredGameRound(GAME_COLORS)
+  if (finalized) void publishOwnerDashboardUpdate()
+  return { success: true, data: demoMode ? getDemoCurrentRound() : await getCurrentGameRound(GAME_COLORS) }
 })
 app.post('/api/game/rounds/:id/predictions', { preHandler: requireAuth }, async (request, reply) => {
   const amount = Number(request.body?.amount)
@@ -468,6 +581,7 @@ app.post('/api/game/rounds/:id/predictions', { preHandler: requireAuth }, async 
         color: request.body.color,
         amount,
       })
+      void publishOwnerDashboardUpdate()
       return reply.code(201).send({ success: true, data: prediction })
     }
   } catch (error) {
@@ -478,6 +592,7 @@ app.post('/api/game/rounds/:id/predictions', { preHandler: requireAuth }, async 
   }
   const prediction = { id: randomUUID(), userId: request.user.id, roundId: round.id, selectedColor: request.body.color, virtualCoinAmount: amount, status: 'pending', createdAt: now() }
   state.predictions.push(prediction)
+  void publishOwnerDashboardUpdate()
   return reply.code(201).send({ success: true, data: prediction })
 })
 app.get('/api/games/history', { preHandler: requireAuth }, async (request) => ({
@@ -568,9 +683,105 @@ app.get('/api/admin/stats', { preHandler: requireOwnerAdmin }, async () => ({
     ? { users: state.users.length, groups: state.groups.length, messages: state.messages.length, rounds: state.rounds.length, transactions: state.transactions.length }
     : await getPersistentAdminStats(),
 }))
+app.get('/api/admin/game', { preHandler: requireOwnerAdmin }, async () => {
+  const dashboard = await getOwnerDashboardSnapshot()
+  const history = demoMode
+    ? getDemoRoundHistory({ limit: 10, offset: 0 })
+    : await getGameRoundHistory({ limit: 10, offset: 0 })
+  return { success: true, data: { ...dashboard, history } }
+})
+app.get('/api/admin/game/rounds', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const { status, from, to } = request.query
+  const allowedStatuses = new Set(['scheduled', 'active', 'closed', 'processing', 'completed', 'paused'])
+  const limit = Number(request.query.limit ?? 10)
+  const offset = Number(request.query.offset ?? 0)
+  if ((status && status !== 'all' && !allowedStatuses.has(status))
+    || !Number.isInteger(limit) || limit < 1 || limit > 100
+    || !Number.isInteger(offset) || offset < 0
+    || (from && !Number.isFinite(Date.parse(from)))
+    || (to && !Number.isFinite(Date.parse(to)))) {
+    return reply.code(400).send({ success: false, error: { code: 'INVALID_FILTER', message: 'Round history filters are invalid' } })
+  }
+  const filters = { limit, offset, status: status === 'all' ? null : status, from, to }
+  const history = demoMode ? getDemoRoundHistory(filters) : await getGameRoundHistory(filters)
+  return { success: true, data: history }
+})
+app.post('/api/admin/game/rounds/:id/pause', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const roundId = request.params.id
+  const reason = String(request.body?.reason || '').trim()
+  if (!isUuid(roundId)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Round not found' } })
+  if (reason.length < 3 || reason.length > 300) return reply.code(400).send({ success: false, error: { code: 'INVALID_REASON', message: 'A pause reason of 3-300 characters is required' } })
+  try {
+    let round
+    if (demoMode) {
+      round = state.rounds.find((item) => item.id === roundId)
+      if (!round) throw new Error('ROUND_NOT_FOUND')
+      if (round.status !== 'active') throw new Error('ROUND_NOT_ACTIVE')
+      if (new Date(round.endTime) <= new Date()) throw new Error('ROUND_CLOSED')
+      round.status = 'paused'
+      round.pausedAt = now()
+      state.auditEvents.push({ id: randomUUID(), actorId: request.user.id, action: 'game.round.paused', entityType: 'game_round', entityId: roundId, metadata: { reason }, createdAt: now() })
+    } else {
+      round = await pausePersistentGameRound(roundId, request.user.id, reason)
+    }
+    void publishOwnerDashboardUpdate()
+    return { success: true, data: round }
+  } catch (error) {
+    if (error.message === 'ROUND_NOT_FOUND') return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Round not found' } })
+    if (error.message === 'ROUND_NOT_ACTIVE') return reply.code(409).send({ success: false, error: { code: 'ROUND_NOT_ACTIVE', message: 'Only an active round can be paused' } })
+    if (error.message === 'ROUND_CLOSED') return reply.code(409).send({ success: false, error: { code: 'ROUND_CLOSED', message: 'An expired round cannot be paused' } })
+    throw error
+  }
+})
+app.post('/api/admin/game/rounds/:id/resume', { preHandler: requireOwnerAdmin }, async (request, reply) => {
+  const roundId = request.params.id
+  if (!isUuid(roundId)) return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Round not found' } })
+  try {
+    let round
+    if (demoMode) {
+      round = state.rounds.find((item) => item.id === roundId)
+      if (!round) throw new Error('ROUND_NOT_FOUND')
+      if (round.status !== 'paused') throw new Error('ROUND_NOT_PAUSED')
+      const pausedDuration = Date.now() - new Date(round.pausedAt).getTime()
+      round.endTime = new Date(new Date(round.endTime).getTime() + pausedDuration).toISOString()
+      round.pausedAt = null
+      round.status = 'active'
+      state.auditEvents.push({ id: randomUUID(), actorId: request.user.id, action: 'game.round.resumed', entityType: 'game_round', entityId: roundId, metadata: {}, createdAt: now() })
+    } else {
+      round = await resumePersistentGameRound(roundId, request.user.id)
+    }
+    void publishOwnerDashboardUpdate()
+    return { success: true, data: round }
+  } catch (error) {
+    if (error.message === 'ROUND_NOT_FOUND') return reply.code(404).send({ success: false, error: { code: 'NOT_FOUND', message: 'Round not found' } })
+    if (error.message === 'ROUND_NOT_PAUSED') return reply.code(409).send({ success: false, error: { code: 'ROUND_NOT_PAUSED', message: 'Only a paused round can be resumed' } })
+    throw error
+  }
+})
 
-io.use((socket, next) => { try { const token = socket.handshake.auth?.token; socket.user = jwt.verify(token, config.JWT_SECRET); next() } catch { next(new Error('Unauthorized')) } })
+io.use(async (socket, next) => {
+  try {
+    const claims = jwt.verify(socket.handshake.auth?.token, config.JWT_SECRET)
+    const user = demoMode
+      ? state.users.find((item) => item.id === claims.sub)
+      : await getUserById(claims.sub)
+    if (!user || user.status !== 'active') throw new Error('Unauthorized')
+    socket.user = { sub: user.id, email: user.email }
+    next()
+  } catch {
+    next(new Error('Unauthorized'))
+  }
+})
 io.on('connection', (socket) => {
+  socket.on('admin.game.join', async (acknowledge) => {
+    const respond = typeof acknowledge === 'function' ? acknowledge : () => {}
+    if (!matchesOwnerEmail(socket.user.email, config.OWNER_EMAIL)) {
+      respond({ success: false, error: { code: 'FORBIDDEN', message: 'Owner access required' } })
+      return
+    }
+    await socket.join('admin:game')
+    respond({ success: true })
+  })
   socket.on('group.join', async (groupId, acknowledge) => {
     const respond = typeof acknowledge === 'function' ? acknowledge : () => {}
     try {
@@ -598,6 +809,18 @@ io.on('connection', (socket) => {
     }
   })
 })
+
+const roundSettlementInterval = setInterval(async () => {
+  try {
+    const completed = demoMode
+      ? settleDemoRound(state.rounds.slice().reverse().find((item) => item.status === 'active'))
+      : await settleExpiredGameRound(GAME_COLORS)
+    if (completed) await publishOwnerDashboardUpdate()
+  } catch (error) {
+    app.log.error(error, 'Unable to settle an expired game round')
+  }
+}, 1000)
+roundSettlementInterval.unref()
 
 const port = Number(config.PORT)
 await app.listen({ port, host: '0.0.0.0' })

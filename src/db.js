@@ -6,7 +6,7 @@ export const pool = config.DATABASE_URL ? new Pool({ connectionString: config.DA
 
 const state = {
   users: [], profiles: [], wallets: [], transactions: [], packages: [20, 50, 200, 499, 999].map((price, index) => ({ id: `package-${price}`, amountInr: price, coinAmount: [15, 45, 220, 720, 1820][index], displayOrder: index + 1, isActive: true })),
-  groups: [], messages: [], follows: [], rounds: [], predictions: [], notifications: [],
+  groups: [], messages: [], follows: [], rounds: [], predictions: [], notifications: [], auditEvents: [],
 }
 
 export async function query(text, values = []) {

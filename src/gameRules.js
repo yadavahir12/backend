@@ -1,5 +1,12 @@
+import { randomInt } from 'node:crypto'
+
 export const GAME_COLORS = ['Red', 'Green', 'Violet']
 export const LEADERBOARD_METRIC = 'total_wins'
+
+export function generateFairGameResult(colors = GAME_COLORS) {
+  if (!Array.isArray(colors) || colors.length === 0) throw new Error('At least one game result must be configured')
+  return colors[randomInt(colors.length)]
+}
 
 export function isValidColor(color) {
   return GAME_COLORS.includes(color)

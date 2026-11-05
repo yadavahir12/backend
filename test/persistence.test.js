@@ -13,6 +13,8 @@ import {
   getFollowStatus,
   getGameResult,
   getGameHistory,
+  getGameRoundHistory,
+  getRoundColorStats,
   getGroup,
   getGroupMessages,
   getGroups,
@@ -26,6 +28,9 @@ import {
   getWalletTransactions,
   joinGroup,
   markNotificationsRead,
+  pauseGameRound,
+  resumeGameRound,
+  settleExpiredGameRound,
   updateProfile,
   unfollowUser,
 } from '../src/persistence.js'
@@ -236,6 +241,28 @@ test('updates wallet and records its transaction atomically', async () => {
   assert.deepEqual(database.calls[2].values, ['user-id', -25])
   assert.deepEqual(database.calls[3].values.slice(1, 6), ['user-id', 'ADMIN_ADJUSTMENT', -25, 100, 75])
   assert.equal(database.calls.at(-1).text, 'COMMIT')
+})
+
+test('records an audit event for owner wallet adjustments in the same transaction', async () => {
+  const database = createFakePool([
+    { user_id: 'target-id', balance: 100 },
+    { user_id: 'target-id', balance: 125 },
+    { id: 'transaction-id', user_id: 'target-id', type: 'ADMIN_ADJUSTMENT', amount: 25, balance_before: 100, balance_after: 125 },
+    undefined,
+  ])
+  await adjustWallet('target-id', {
+    amount: 25,
+    type: 'ADMIN_ADJUSTMENT',
+    description: 'Support adjustment',
+    actorId: 'owner-id',
+  }, database)
+  assert.match(database.calls[4].text, /admin\.wallet\.adjusted/)
+  assert.deepEqual(database.calls[4].values.slice(1, 3), ['owner-id', 'target-id'])
+  assert.deepEqual(JSON.parse(database.calls[4].values[3]), {
+    amount: 25,
+    type: 'ADMIN_ADJUSTMENT',
+    description: 'Support adjustment',
+  })
 })
 
 test('rejects a wallet debit that would make the balance negative', async () => {
@@ -466,6 +493,7 @@ test('returns only public profile fields and follower counts', async () => {
 test('returns the active persisted round or creates the next round safely', async () => {
   const activeDatabase = createFakePool([
     undefined,
+    undefined,
     { id: 'round-id', round_number: '2049', status: 'active', start_time: 'start', end_time: 'end', result: null },
   ])
   assert.deepEqual(await getCurrentGameRound(['Red', 'Green'], activeDatabase), {
@@ -476,9 +504,11 @@ test('returns the active persisted round or creates the next round safely', asyn
     endTime: 'end',
     colors: ['Red', 'Green'],
     result: null,
+    resultGeneratedAt: null,
+    pausedAt: null,
   })
   assert.match(activeDatabase.calls[1].text, /pg_advisory_xact_lock/)
-  assert.match(activeDatabase.calls[2].text, /FOR UPDATE/)
+  assert.match(activeDatabase.calls[3].text, /FOR UPDATE/)
 
   const newDatabase = createFakePool([
     undefined,
@@ -489,9 +519,125 @@ test('returns the active persisted round or creates the next round safely', asyn
   ])
   const nextRound = await getCurrentGameRound(['Red', 'Green', 'Violet'], newDatabase)
   assert.equal(nextRound.roundNumber, 2050)
-  assert.match(newDatabase.calls[3].text, /UPDATE game_rounds/)
+  assert.match(newDatabase.calls[5].text, /INSERT INTO game_rounds/)
   assert.equal(newDatabase.calls[5].values[1], 2050)
   assert.equal(newDatabase.calls.at(-1).text, 'COMMIT')
+})
+
+test('settles an expired round once with a server-generated color and audits the result', async () => {
+  const expiredRound = {
+    id: 'round-id',
+    round_number: '2050',
+    status: 'active',
+    start_time: 'start',
+    end_time: 'end',
+    result: null,
+  }
+  const database = createFakePool([
+    undefined,
+    expiredRound,
+    { ...expiredRound, status: 'completed', result: 'Red', result_generated_at: 'generated' },
+    undefined,
+    undefined,
+  ])
+  const result = await settleExpiredGameRound(['Red', 'Green', 'Violet'], database)
+  assert.equal(result.status, 'completed')
+  assert.ok(['Red', 'Green', 'Violet'].includes(result.result))
+  assert.ok(['Red', 'Green', 'Violet'].includes(database.calls[3].values[1]))
+  assert.equal(JSON.parse(database.calls[5].values[2]).result, database.calls[3].values[1])
+  assert.equal(result.resultGeneratedAt, 'generated')
+  assert.match(database.calls[4].text, /UPDATE game_predictions/)
+  assert.match(database.calls[5].text, /game\.round\.result_generated/)
+  assert.equal(database.calls[5].values[2].includes('"algorithm":"node:crypto.randomInt"'), true)
+
+  const alreadySettled = createFakePool([undefined, undefined])
+  assert.equal(await settleExpiredGameRound(['Red', 'Green', 'Violet'], alreadySettled), null)
+  assert.equal(alreadySettled.calls.some(({ text }) => text.includes('game.round.result_generated')), false)
+})
+
+test('calculates privacy-safe round color aggregates from prediction records', async () => {
+  const database = createFakePool([{
+    round_id: 'round-id',
+    round_number: '2050',
+    status: 'active',
+    start_time: 'start',
+    end_time: 'end',
+    total_selections: 4,
+    active_players: 3,
+    red_players: 1,
+    red_selections: 1,
+    green_players: 1,
+    green_selections: 2,
+    violet_players: 1,
+    violet_selections: 1,
+  }])
+  const result = await getRoundColorStats('round-id', database)
+  assert.equal(result.activePlayers, 3)
+  assert.equal(result.totalSelections, 4)
+  assert.deepEqual(result.colors, {
+    Red: { players: 1, selections: 1, percentage: 25 },
+    Green: { players: 1, selections: 2, percentage: 50 },
+    Violet: { players: 1, selections: 1, percentage: 25 },
+  })
+  assert.doesNotMatch(database.calls[0].text, /email|username|display_name/i)
+})
+
+test('paginates round history with status and date filters', async () => {
+  const database = createFakePool([{
+    id: 'round-id',
+    round_number: '2050',
+    status: 'completed',
+    start_time: 'start',
+    end_time: 'end',
+    result: 'Green',
+    result_generated_at: 'generated',
+    total_players: 3,
+    total_count: 21,
+  }])
+  const result = await getGameRoundHistory({
+    limit: 10,
+    offset: 10,
+    status: 'completed',
+    from: '2026-01-01T00:00:00Z',
+    to: '2026-02-01T00:00:00Z',
+  }, database)
+  assert.deepEqual(result, {
+    items: [{
+      id: 'round-id',
+      roundNumber: 2050,
+      status: 'completed',
+      startTime: 'start',
+      endTime: 'end',
+      result: 'Green',
+      resultGeneratedAt: 'generated',
+      totalPlayers: 3,
+    }],
+    total: 21,
+  })
+  assert.deepEqual(database.calls[0].values, ['completed', '2026-01-01T00:00:00Z', '2026-02-01T00:00:00Z', 10, 10])
+  assert.match(database.calls[0].text, /LEFT JOIN LATERAL/)
+})
+
+test('pauses and resumes rounds with audit records and preserves pause-adjusted time', async () => {
+  const pausedDatabase = createFakePool([
+    { id: 'round-id', status: 'active' },
+    { id: 'round-id', round_number: 1, status: 'paused', start_time: 'start', end_time: 'end', paused_at: 'paused' },
+    undefined,
+  ])
+  const paused = await pauseGameRound('round-id', 'owner-id', 'Technical issue', pausedDatabase)
+  assert.equal(paused.status, 'paused')
+  assert.match(pausedDatabase.calls[3].text, /game\.round\.paused/)
+  assert.deepEqual(JSON.parse(pausedDatabase.calls[3].values[3]), { reason: 'Technical issue' })
+
+  const resumedDatabase = createFakePool([
+    { id: 'round-id', status: 'paused' },
+    { id: 'round-id', round_number: 1, status: 'active', start_time: 'start', end_time: 'end' },
+    undefined,
+  ])
+  const resumed = await resumeGameRound('round-id', 'owner-id', resumedDatabase)
+  assert.equal(resumed.status, 'active')
+  assert.match(resumedDatabase.calls[2].text, /end_time = end_time \+ \(now\(\) - paused_at\)/)
+  assert.match(resumedDatabase.calls[3].text, /game\.round\.resumed/)
 })
 
 test('atomically debits coins and saves a game prediction', async () => {

@@ -35,14 +35,14 @@ async function startBackend(ownerEmail) {
     stdio: 'ignore',
   })
   const baseUrl = `http://127.0.0.1:${port}`
-  const deadline = Date.now() + 10000
+  const deadline = Date.now() + 20000
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`Backend exited before becoming ready (${child.exitCode}).`)
     try {
       const response = await fetch(`${baseUrl}/health`)
       if (response.ok) return { child, baseUrl }
     } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    await new Promise((resolve) => setTimeout(resolve, 100))
   }
   child.kill()
   throw new Error('Backend did not become ready in time.')
@@ -89,6 +89,7 @@ test('owner status and admin APIs use the authenticated account email', async ()
     })
     assert.equal(regularRegistration.status, 201)
     const regularToken = regularRegistration.body.data.token
+    const regularUserId = regularRegistration.body.data.user.id
 
     const [ownerStatus, regularStatus] = await Promise.all([
       apiRequest(backend.baseUrl, '/api/users/me', { token: ownerToken }),
@@ -106,6 +107,66 @@ test('owner status and admin APIs use the authenticated account email', async ()
       body: {},
     })).status, 403)
     assert.equal((await apiRequest(backend.baseUrl, '/api/admin/stats', { token: ownerToken })).status, 200)
+
+    assert.equal((await apiRequest(backend.baseUrl, '/api/admin/game', { token: regularToken })).status, 403)
+    const forbiddenPausePath = '/api/admin/game/rounds/00000000-0000-4000-8000-000000000001/pause'
+    assert.equal((await apiRequest(backend.baseUrl, '/api/admin/game/rounds?status=all', { token: regularToken })).status, 403)
+    assert.equal((await apiRequest(backend.baseUrl, forbiddenPausePath, {
+      token: regularToken,
+      method: 'POST',
+      body: { reason: 'Should be denied' },
+    })).status, 403)
+    assert.equal((await apiRequest(backend.baseUrl, forbiddenPausePath.replace('/pause', '/resume'), {
+      token: regularToken,
+      method: 'POST',
+      body: {},
+    })).status, 403)
+    const adjusted = await apiRequest(backend.baseUrl, '/api/admin/wallet-adjustments', {
+      token: ownerToken,
+      method: 'POST',
+      body: { userId: regularUserId, amount: 100, reason: 'dashboard test' },
+    })
+    assert.equal(adjusted.status, 200)
+    const initialDashboard = await apiRequest(backend.baseUrl, '/api/admin/game', { token: ownerToken })
+    assert.equal(initialDashboard.status, 200)
+    const roundId = initialDashboard.body.data.currentRound.id
+    const ownerPrediction = await apiRequest(backend.baseUrl, `/api/game/rounds/${roundId}/predictions`, {
+      token: ownerToken,
+      method: 'POST',
+      body: { color: 'Red', amount: 50 },
+    })
+    const regularPrediction = await apiRequest(backend.baseUrl, `/api/game/rounds/${roundId}/predictions`, {
+      token: regularToken,
+      method: 'POST',
+      body: { color: 'Green', amount: 50 },
+    })
+    assert.equal(ownerPrediction.status, 201)
+    assert.equal(regularPrediction.status, 201)
+    const populatedDashboard = await apiRequest(backend.baseUrl, '/api/admin/game', { token: ownerToken })
+    const statistics = populatedDashboard.body.data.statistics
+    assert.equal(statistics.activePlayers, 2)
+    assert.equal(statistics.totalSelections, 2)
+    assert.deepEqual(statistics.colors.Red, { players: 1, selections: 1, percentage: 50 })
+    assert.deepEqual(statistics.colors.Green, { players: 1, selections: 1, percentage: 50 })
+    assert.deepEqual(statistics.colors.Violet, { players: 0, selections: 0, percentage: 0 })
+
+    const pause = await apiRequest(backend.baseUrl, `/api/admin/game/rounds/${roundId}/pause`, {
+      token: ownerToken,
+      method: 'POST',
+      body: { reason: 'Testing technical pause' },
+    })
+    assert.equal(pause.status, 200)
+    assert.equal(pause.body.data.status, 'paused')
+    const resume = await apiRequest(backend.baseUrl, `/api/admin/game/rounds/${roundId}/resume`, {
+      token: ownerToken,
+      method: 'POST',
+      body: {},
+    })
+    assert.equal(resume.status, 200)
+    assert.equal(resume.body.data.status, 'active')
+    const page = await apiRequest(backend.baseUrl, '/api/admin/game/rounds?status=all&limit=10&offset=0', { token: ownerToken })
+    assert.equal(page.status, 200)
+    assert.equal(page.body.data.total, 1)
   } finally {
     await stopBackend(backend.child)
   }

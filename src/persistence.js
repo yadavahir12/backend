@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { pool, withTransaction } from './db.js'
+import { generateFairGameResult } from './gameRules.js'
 
 export function mapUser(row) {
   if (!row) return null
@@ -104,6 +105,8 @@ export function mapGameRound(row) {
     endTime: row.end_time ?? row.endTime,
     colors: row.colors,
     result: row.result ?? null,
+    resultGeneratedAt: row.result_generated_at ?? row.resultGeneratedAt ?? null,
+    pausedAt: row.paused_at ?? row.pausedAt ?? null,
   }
 }
 
@@ -309,7 +312,7 @@ export async function getWalletTransactions(userId, database = pool) {
   return result.rows.map(mapCoinTransaction)
 }
 
-export async function adjustWallet(userId, { amount, type, description, referenceType = null, referenceId = null, idempotencyKey = null }, database = pool) {
+export async function adjustWallet(userId, { amount, type, description, referenceType = null, referenceId = null, idempotencyKey = null, actorId = null }, database = pool) {
   if (!Number.isSafeInteger(amount) || amount === 0) throw new Error('INVALID_COIN_ADJUSTMENT')
   return withTransaction(async (client) => {
     if (idempotencyKey) {
@@ -364,6 +367,13 @@ export async function adjustWallet(userId, { amount, type, description, referenc
         idempotencyKey,
       ],
     )
+    if (actorId) {
+      await client.query(
+        `INSERT INTO audit_events (id, actor_id, action, entity_type, entity_id, metadata)
+         VALUES ($1, $2, 'admin.wallet.adjusted', 'user_wallet', $3, $4::jsonb)`,
+        [randomUUID(), actorId, userId, JSON.stringify({ amount, type, description: description || '' })],
+      )
+    }
     return { wallet: mapWallet(updated.rows[0]), transaction: mapCoinTransaction(transaction.rows[0]), duplicate: false }
   }, database)
 }
@@ -371,40 +381,198 @@ export async function adjustWallet(userId, { amount, type, description, referenc
 export async function getCurrentGameRound(colors, database = pool) {
   return withTransaction(async (client) => {
     await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [684029])
-    const active = await client.query(
-      `SELECT id, round_number, status, start_time, end_time, result
+    const expired = await client.query(
+      `SELECT id, round_number, status, start_time, end_time, result, result_generated_at, paused_at
        FROM game_rounds
-       WHERE status = 'active' AND end_time > now()
+       WHERE status = 'active' AND end_time <= now() AND result IS NULL
+       ORDER BY round_number DESC
+       LIMIT 1
+       FOR UPDATE`,
+    )
+    if (expired.rows[0]) await settleRound(client, expired.rows[0], colors)
+    const active = await client.query(
+      `SELECT id, round_number, status, start_time, end_time, result, result_generated_at, paused_at
+       FROM game_rounds
+       WHERE status IN ('active', 'paused')
        ORDER BY round_number DESC
        LIMIT 1
        FOR UPDATE`,
     )
     if (active.rows[0]) return mapGameRound({ ...active.rows[0], colors })
-
-    await client.query(
-      `UPDATE game_rounds SET status = 'completed', updated_at = now()
-       WHERE status = 'active' AND end_time <= now()`,
-    )
     const latest = await client.query('SELECT COALESCE(MAX(round_number), 2048) AS round_number FROM game_rounds')
     const startTime = new Date()
     const endTime = new Date(startTime.getTime() + 42000)
     const created = await client.query(
       `INSERT INTO game_rounds (id, round_number, status, start_time, end_time)
        VALUES ($1, $2, 'active', $3, $4)
-       RETURNING id, round_number, status, start_time, end_time, result`,
+       RETURNING id, round_number, status, start_time, end_time, result, result_generated_at, paused_at`,
       [randomUUID(), Number(latest.rows[0].round_number) + 1, startTime, endTime],
     )
     return mapGameRound({ ...created.rows[0], colors })
   }, database)
 }
 
+async function settleRound(client, round, colors) {
+  const result = generateFairGameResult(colors)
+  const completed = await client.query(
+    `UPDATE game_rounds
+     SET status = 'completed', result = $2, result_generated_at = now(), updated_at = now()
+     WHERE id = $1 AND status = 'active' AND result IS NULL
+     RETURNING id, round_number, status, start_time, end_time, result, result_generated_at, paused_at`,
+    [round.id, result],
+  )
+  if (!completed.rows[0]) return null
+  await client.query(
+    `UPDATE game_predictions
+     SET status = CASE WHEN selected_color = $2 THEN 'won' ELSE 'lost' END
+     WHERE round_id = $1 AND status = 'pending'`,
+    [round.id, result],
+  )
+  await client.query(
+    `INSERT INTO audit_events (id, actor_id, action, entity_type, entity_id, metadata)
+     VALUES ($1, NULL, 'game.round.result_generated', 'game_round', $2, $3::jsonb)`,
+    [randomUUID(), round.id, JSON.stringify({ result, algorithm: 'node:crypto.randomInt', colorCount: colors.length })],
+  )
+  return mapGameRound(completed.rows[0])
+}
+
+export async function settleExpiredGameRound(colors, database = pool) {
+  return withTransaction(async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [684029])
+    const expired = await client.query(
+      `SELECT id, round_number, status, start_time, end_time, result, result_generated_at, paused_at
+       FROM game_rounds
+       WHERE status = 'active' AND end_time <= now() AND result IS NULL
+       ORDER BY round_number DESC
+       LIMIT 1
+       FOR UPDATE`,
+    )
+    if (!expired.rows[0]) return null
+    return settleRound(client, expired.rows[0], colors)
+  }, database)
+}
+
 export async function getGameRound(roundId, database = pool) {
   const result = await database.query(
-    `SELECT id, round_number, status, start_time, end_time, result
+    `SELECT id, round_number, status, start_time, end_time, result, result_generated_at, paused_at
      FROM game_rounds WHERE id = $1`,
     [roundId],
   )
   return mapGameRound(result.rows[0])
+}
+
+export async function getRoundColorStats(roundId, database = pool) {
+  const result = await database.query(
+    `SELECT gr.id AS round_id, gr.round_number, gr.status, gr.start_time, gr.end_time,
+            gr.result, gr.result_generated_at, gr.paused_at,
+            count(gp.id)::int AS total_selections,
+            count(DISTINCT gp.user_id)::int AS active_players,
+            count(gp.id) FILTER (WHERE gp.selected_color = 'Red')::int AS red_selections,
+            count(DISTINCT gp.user_id) FILTER (WHERE gp.selected_color = 'Red')::int AS red_players,
+            count(gp.id) FILTER (WHERE gp.selected_color = 'Green')::int AS green_selections,
+            count(DISTINCT gp.user_id) FILTER (WHERE gp.selected_color = 'Green')::int AS green_players,
+            count(gp.id) FILTER (WHERE gp.selected_color = 'Violet')::int AS violet_selections,
+            count(DISTINCT gp.user_id) FILTER (WHERE gp.selected_color = 'Violet')::int AS violet_players
+     FROM game_rounds gr
+     LEFT JOIN game_predictions gp ON gp.round_id = gr.id
+     WHERE gr.id = $1
+     GROUP BY gr.id`,
+    [roundId],
+  )
+  const row = result.rows[0]
+  if (!row) return null
+  const totalSelections = Number(row.total_selections)
+  const distribution = (count) => totalSelections ? Number((Number(count) * 100 / totalSelections).toFixed(1)) : 0
+  return {
+    roundId: row.round_id,
+    roundNumber: Number(row.round_number),
+    status: row.status,
+    startTime: row.start_time,
+    endTime: row.end_time,
+    result: row.result,
+    resultGeneratedAt: row.result_generated_at,
+    pausedAt: row.paused_at,
+    totalSelections,
+    activePlayers: Number(row.active_players),
+    colors: {
+      Red: { players: Number(row.red_players), selections: Number(row.red_selections), percentage: distribution(row.red_selections) },
+      Green: { players: Number(row.green_players), selections: Number(row.green_selections), percentage: distribution(row.green_selections) },
+      Violet: { players: Number(row.violet_players), selections: Number(row.violet_selections), percentage: distribution(row.violet_selections) },
+    },
+  }
+}
+
+export async function getGameRoundHistory({ limit, offset, status, from, to }, database = pool) {
+  const result = await database.query(
+    `WITH filtered AS (
+       SELECT id, round_number, status, start_time, end_time, result, result_generated_at,
+              (SELECT count(DISTINCT gp.user_id)::int FROM game_predictions gp WHERE gp.round_id = game_rounds.id) AS total_players
+       FROM game_rounds
+       WHERE ($1::text IS NULL OR status = $1)
+         AND ($2::timestamptz IS NULL OR start_time >= $2)
+         AND ($3::timestamptz IS NULL OR start_time < $3)
+     ),
+     totals AS (SELECT count(*)::int AS total_count FROM filtered)
+     SELECT page.*, totals.total_count
+     FROM totals
+     LEFT JOIN LATERAL (
+       SELECT * FROM filtered ORDER BY round_number DESC LIMIT $4 OFFSET $5
+     ) page ON true`,
+    [status || null, from || null, to || null, limit, offset],
+  )
+  return {
+    items: result.rows.filter((row) => row.id).map((row) => ({
+      id: row.id,
+      roundNumber: Number(row.round_number),
+      status: row.status,
+      startTime: row.start_time,
+      endTime: row.end_time,
+      result: row.result,
+      resultGeneratedAt: row.result_generated_at,
+      totalPlayers: Number(row.total_players),
+    })),
+    total: Number(result.rows[0]?.total_count || 0),
+  }
+}
+
+export async function pauseGameRound(roundId, actorId, reason, database = pool) {
+  return withTransaction(async (client) => {
+    const current = await client.query('SELECT id, status, end_time FROM game_rounds WHERE id = $1 FOR UPDATE', [roundId])
+    if (current.rows[0]?.status !== 'active') throw new Error(current.rows[0] ? 'ROUND_NOT_ACTIVE' : 'ROUND_NOT_FOUND')
+    if (new Date(current.rows[0].end_time) <= new Date()) throw new Error('ROUND_CLOSED')
+    const result = await client.query(
+      `UPDATE game_rounds SET status = 'paused', paused_at = now(), updated_at = now()
+       WHERE id = $1 AND status = 'active'
+       RETURNING id, round_number, status, start_time, end_time, result, result_generated_at, paused_at`,
+      [roundId],
+    )
+    await client.query(
+      `INSERT INTO audit_events (id, actor_id, action, entity_type, entity_id, metadata)
+       VALUES ($1, $2, 'game.round.paused', 'game_round', $3, $4::jsonb)`,
+      [randomUUID(), actorId, roundId, JSON.stringify({ reason })],
+    )
+    return mapGameRound(result.rows[0])
+  }, database)
+}
+
+export async function resumeGameRound(roundId, actorId, database = pool) {
+  return withTransaction(async (client) => {
+    const current = await client.query('SELECT id, status FROM game_rounds WHERE id = $1 FOR UPDATE', [roundId])
+    if (current.rows[0]?.status !== 'paused') throw new Error(current.rows[0] ? 'ROUND_NOT_PAUSED' : 'ROUND_NOT_FOUND')
+    const result = await client.query(
+      `UPDATE game_rounds
+       SET status = 'active', end_time = end_time + (now() - paused_at), paused_at = NULL, updated_at = now()
+       WHERE id = $1 AND status = 'paused'
+       RETURNING id, round_number, status, start_time, end_time, result, result_generated_at, paused_at`,
+      [roundId],
+    )
+    await client.query(
+      `INSERT INTO audit_events (id, actor_id, action, entity_type, entity_id, metadata)
+       VALUES ($1, $2, 'game.round.resumed', 'game_round', $3, '{}'::jsonb)`,
+      [randomUUID(), actorId, roundId],
+    )
+    return mapGameRound(result.rows[0])
+  }, database)
 }
 
 export async function createPrediction({ id = randomUUID(), userId, roundId, color, amount }, database = pool) {
