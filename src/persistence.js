@@ -58,6 +58,7 @@ export function mapCoinTransaction(row) {
 
 export function mapGroup(row) {
   if (!row) return null
+  const latestMessage = row.latest_message ?? row.latestMessage
   const group = {
     id: row.id,
     name: row.name,
@@ -67,6 +68,7 @@ export function mapGroup(row) {
     memberCount: Number(row.member_count ?? row.memberCount ?? 0),
     createdAt: row.created_at ?? row.createdAt,
   }
+  if (latestMessage) group.latestMessage = latestMessage
   return group
 }
 
@@ -903,17 +905,36 @@ export async function getAdminStats(database = pool) {
   return result.rows[0]
 }
 
-export async function getGroups(database = pool) {
+export async function getGroups(database = pool, userId = null) {
   const result = await database.query(
     `SELECT g.id, g.name, g.icon_url, g.owner_id, g.visibility, g.created_at,
-            COALESCE(m.member_count, 0)::int AS member_count
+            COALESCE(m.member_count, 0)::int AS member_count,
+            latest.latest_message
      FROM groups g
      LEFT JOIN LATERAL (
        SELECT count(*) AS member_count
        FROM group_members gm WHERE gm.group_id = g.id
      ) m ON true
+     LEFT JOIN LATERAL (
+       SELECT jsonb_build_object(
+                'text', CASE WHEN msg.deleted_at IS NOT NULL THEN 'This message was deleted' ELSE msg.text END,
+                'senderName', COALESCE(p.display_name, u.username),
+                'createdAt', msg.created_at
+              ) AS latest_message
+       FROM messages msg
+       JOIN users u ON u.id = msg.sender_id
+       LEFT JOIN profiles p ON p.user_id = u.id
+       WHERE msg.group_id = g.id
+         AND (g.visibility = 'public' OR EXISTS (
+           SELECT 1 FROM group_members viewer
+           WHERE viewer.group_id = g.id AND viewer.user_id = $1
+         ))
+       ORDER BY msg.created_at DESC, msg.id DESC
+       LIMIT 1
+     ) latest ON true
      WHERE g.status = 'active'
      ORDER BY g.created_at DESC`,
+    [userId],
   )
   return result.rows.map(mapGroup)
 }

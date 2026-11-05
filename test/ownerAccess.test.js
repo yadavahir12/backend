@@ -74,6 +74,45 @@ test('owner email matching is case-insensitive and denies missing configuration'
   assert.equal(matchesOwnerEmail('', 'owner@example.com'), false)
 })
 
+test('group list returns the latest real message preview after sending', async () => {
+  const backend = await startBackend('alex@example.com')
+  try {
+    const login = await apiRequest(backend.baseUrl, '/api/auth/login', {
+      method: 'POST',
+      body: { username: 'alex@example.com', password: 'demo-password' },
+    })
+    const token = login.body.data.token
+    const groups = await apiRequest(backend.baseUrl, '/api/groups', { token })
+    const group = groups.body.data.find((item) => item.name === 'Color Chasers')
+    assert.ok(group)
+    assert.equal((await apiRequest(backend.baseUrl, `/api/groups/${group.id}/join`, {
+      token,
+      method: 'POST',
+      body: {},
+    })).status, 200)
+
+    const messageResponse = await apiRequest(backend.baseUrl, `/api/groups/${group.id}/messages`, {
+      token,
+      method: 'POST',
+      body: {
+        clientMessageId: '11111111-1111-4111-8111-111111111111',
+        text: 'Ready for the next round?',
+      },
+    })
+    assert.equal(messageResponse.status, 201)
+
+    const refreshedGroups = await apiRequest(backend.baseUrl, '/api/groups', { token })
+    const refreshedGroup = refreshedGroups.body.data.find((item) => item.id === group.id)
+    assert.deepEqual(refreshedGroup.latestMessage, {
+      text: 'Ready for the next round?',
+      senderName: 'Alex Morgan',
+      createdAt: messageResponse.body.data.createdAt,
+    })
+  } finally {
+    await stopBackend(backend.child)
+  }
+})
+
 test('owner status and admin APIs use the authenticated account email', async () => {
   const backend = await startBackend('Alex@Example.com')
   try {

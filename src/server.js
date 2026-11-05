@@ -103,6 +103,27 @@ function seed() {
 }
 if (demoMode) seed()
 
+function getDemoGroups(userId) {
+  return state.groups.map((group) => {
+    const canReadMessages = group.visibility === 'public'
+      || group.members?.some((member) => member.userId === userId || member.id === userId)
+    if (!canReadMessages) return group
+    const latestMessage = state.messages.reduce((latest, message) => {
+      if (message.groupId !== group.id) return latest
+      return !latest || message.createdAt > latest.createdAt ? message : latest
+    }, null)
+    if (!latestMessage) return group
+    return {
+      ...group,
+      latestMessage: {
+        text: latestMessage.deletedAt ? 'This message was deleted' : latestMessage.text,
+        senderName: latestMessage.senderName,
+        createdAt: latestMessage.createdAt,
+      },
+    }
+  })
+}
+
 function settleDemoRound(round) {
   if (!round || round.status !== 'active' || round.result || new Date(round.endTime) > new Date()) return null
   const result = generateFairGameResult(GAME_COLORS)
@@ -571,9 +592,9 @@ app.post('/api/admin/coins/debit', { preHandler: requireOwnerAdmin }, async (req
 app.post('/api/admin/wallet-adjustments', { preHandler: requireOwnerAdmin }, async (request, reply) => {
   return applyAdminCoinAdjustment(request, reply, Number(request.body?.amount), { legacy: true })
 })
-app.get('/api/groups', { preHandler: requireAuth }, async () => ({
+app.get('/api/groups', { preHandler: requireAuth }, async (request) => ({
   success: true,
-  data: demoMode ? state.groups : await getPersistentGroups(),
+  data: demoMode ? getDemoGroups(request.user.id) : await getPersistentGroups(pool, request.user.id),
 }))
 app.post('/api/groups', { preHandler: requireAuth }, async (request, reply) => {
   const name = String(request.body?.name || '').trim()

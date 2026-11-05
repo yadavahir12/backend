@@ -468,8 +468,9 @@ test('rejects reusing a wallet idempotency key with a different operation', asyn
 })
 
 test('lists groups with member counts and gets a group using parameterized SQL', async () => {
-  const group = { id: 'group-id', name: 'Players', icon_url: null, owner_id: 'owner-id', visibility: 'public', member_count: 2, created_at: 'created' }
-  const database = createFakePool([[group], group])
+  const latestMessage = { text: 'Ready to play?', senderName: 'Player', createdAt: '2026-11-05T10:00:00.000Z' }
+  const group = { id: 'group-id', name: 'Players', icon_url: null, owner_id: 'owner-id', visibility: 'public', member_count: 2, created_at: 'created', latest_message: latestMessage }
+  const database = createFakePool([[group], { ...group, latest_message: undefined }])
 
   assert.deepEqual(await getGroups(database), [{
     id: 'group-id',
@@ -479,8 +480,12 @@ test('lists groups with member counts and gets a group using parameterized SQL',
     visibility: 'public',
     memberCount: 2,
     createdAt: 'created',
+    latestMessage,
   }])
   assert.match(database.calls[0].text, /FROM groups g/)
+  assert.match(database.calls[0].text, /ORDER BY msg\.created_at DESC, msg\.id DESC/)
+  assert.match(database.calls[0].text, /g\.visibility = 'public' OR EXISTS/)
+  assert.deepEqual(database.calls[0].values, [null])
   assert.deepEqual(await getGroup('group-id', database), {
     id: 'group-id',
     name: 'Players',
